@@ -1,0 +1,117 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ux-preview",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "controller/ux"
+      ],
+      "port": 5173
+    },
+    {
+      "name": "ux-preview-alt",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "controller/ux",
+        "--",
+        "--port",
+        "5175",
+        "--strictPort"
+      ],
+      "port": 5175
+    },
+    {
+      "name": "ux-preview-alt2",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "controller/ux",
+        "--",
+        "--port",
+        "5177",
+        "--strictPort"
+      ],
+      "port": 5177
+    },
+    {
+      "name": "ux-preview-alt3",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "controller/ux",
+        "--",
+        "--port",
+        "5179",
+        "--strictPort"
+      ],
+      "port": 5179
+    },
+    {
+      "name": "ux-preview-alt4",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "controller/ux",
+        "--",
+        "--port",
+        "5181",
+        "--strictPort"
+      ],
+      "port": 5181
+    },
+    {
+      "name": "ux-prod-preview",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": [
+        "vite",
+        "preview",
+        "--port",
+        "4173",
+        "--strictPort",
+        "controller/ux"
+      ],
+      "port": 4173
+    },
+    {
+      "name": "landing",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "landing/serve.py",
+        "4180"
+      ],
+      "port": 4180
+    },
+    {
+      "name": "testapp",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "start",
+        "--prefix",
+        "testapp"
+      ],
+      "port": 8099
+    },
+    {
+      "name": "landing-alt",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "landing/serve.py",
+        "4182"
+      ],
+      "port": 4182
+    }
+  ]
+}

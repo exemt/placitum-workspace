@@ -1,0 +1,42 @@
+# Дерево стенда: люди, группы и служебная учётная запись для поиска.
+#
+# Пароли здесь открытым текстом нарочно: это стенд, и slapd сравнивает
+# cleartext при simple bind без дополнительной настройки. В бою на их месте
+# {SSHA}, а сам файл сюда не попадает.
+
+dn: ou=people,dc=corp,dc=example,dc=com
+objectClass: organizationalUnit
+ou: people
+
+dn: ou=groups,dc=corp,dc=example,dc=com
+objectClass: organizationalUnit
+ou: groups
+
+# Служебную запись для поиска заводит сам образ (LDAP_READONLY_USER): ей нужен
+# не только объект, но и ACL. По умолчанию здесь "to * by self read ... by *
+# none", и пользователь, заведённый этим файлом, не увидел бы чужих веток --
+# поиск возвращал бы "No such object" вместо записи. Пароль едет процессу
+# переменной окружения, а не полем профиля: профиль лежит в git.
+
+dn: uid=ivanov,ou=people,dc=corp,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: ivanov
+cn: Ivan Ivanov
+sn: Ivanov
+displayName: Ivan Ivanov
+userPassword: ldap-demo-2fa
+
+# Тот же пароль, но вне группы допуска: проверка членства обязана его не
+# пустить, и отличаться это должно от неверного пароля только в аудите.
+dn: uid=sidorov,ou=people,dc=corp,dc=example,dc=com
+objectClass: inetOrgPerson
+uid: sidorov
+cn: Petr Sidorov
+sn: Sidorov
+displayName: Petr Sidorov
+userPassword: ldap-demo-2fa
+
+dn: cn=waf-users,ou=groups,dc=corp,dc=example,dc=com
+objectClass: groupOfNames
+cn: waf-users
+member: uid=ivanov,ou=people,dc=corp,dc=example,dc=com

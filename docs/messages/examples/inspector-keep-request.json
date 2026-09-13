@@ -1,0 +1,55 @@
+{
+  "v": 2,
+  "rid": "480000013b000000",
+  "ray": "7b21c0a8-f3e1-4d5a-8c2e-91b04f6a1d03",
+  "phase": "request",
+  "wave": 0,
+  "inspector": "modsec",
+  "deadline_ms": 800,
+  "audit_subject": "waf.audit.inspector.modsec",
+  "node": "nginx-1",
+  "conn": {
+    "client_ip": "203.0.113.77",
+    "client_port": 54233,
+    "server_ip": "10.0.0.8",
+    "server_port": 8080
+  },
+  "http": {
+    "method": "POST",
+    "scheme": "https",
+    "host": "shop.example.com",
+    "uri": "/leaks/report",
+    "args_size": 0,
+    "version": "HTTP/1.1"
+  },
+  "needs": ["headers", "args", "body"],
+  "store": {
+    "headers": {
+      "size": 412,
+      "store": "hot",
+      "driver": "redis",
+      "key": "nginx-1:480000013b000000:req:hdr"
+    },
+    "args": null,
+    "body": {
+      "size": 1287,
+      "store": "hot",
+      "driver": "redis",
+      "key": "nginx-1:480000013b000000:req",
+      "complete": true
+    }
+  },
+  "resume": {
+    "want": true,
+    "token": "7b21c0a8f3e14d5a8c2e91b04f6a1d03"
+  },
+  "route": {
+    "server_name": "shop.example.com",
+    "location": "/leaks/",
+    "profile": "strict"
+  },
+  "score": {
+    "total": 0,
+    "deny_at": 50
+  }
+}

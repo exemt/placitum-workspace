@@ -1,0 +1,128 @@
+/* Стиль нарочно скромный: страница нужна как поверхность проверки, а не как витрина. */
+
+:root {
+  --ink: #1b1f24;
+  --dim: #626b75;
+  --line: #d8dee4;
+  --bg: #fbfcfd;
+  --accent: #1f6feb;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+header {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+}
+
+header nav { display: flex; gap: 12px; flex-wrap: wrap; }
+header a { color: var(--accent); text-decoration: none; }
+header a.here { color: var(--ink); font-weight: 600; }
+header .who { margin-left: auto; color: var(--dim); font-size: 13px; }
+
+main { padding: 20px; max-width: 1100px; }
+h1 { font-size: 22px; margin: 0 0 12px; }
+h2 { font-size: 17px; margin: 24px 0 8px; }
+
+aside.ad {
+  margin: 12px 20px 0;
+  padding: 10px 14px;
+  border: 1px dashed #d29922;
+  background: #fff8e5;
+  color: #7a5c00;
+  font-size: 13px;
+}
+
+aside.keep {
+  margin: 8px 20px 0;
+  padding: 10px 14px;
+  border: 1px solid #2da44e;
+  background: #eefbf1;
+  color: #1a6b33;
+  font-size: 13px;
+}
+
+ul.cards {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+}
+
+li.card {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 12px;
+  background: #fff;
+}
+
+li.card h3 { font-size: 15px; margin: 0 0 6px; }
+li.card a { color: var(--ink); text-decoration: none; }
+li.card a:hover h3 { color: var(--accent); }
+.tag { color: var(--dim); font-size: 12px; margin: 2px 0; }
+.price { font-weight: 600; margin: 4px 0; }
+.blurb { color: var(--dim); font-size: 13px; margin: 4px 0; }
+.canary { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: #8250df; margin: 4px 0 0; }
+
+form.search { display: flex; gap: 8px; margin: 12px 0; }
+form.search input[type=text] { flex: 1; max-width: 420px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 4px; }
+button { padding: 6px 14px; border: 1px solid var(--line); border-radius: 4px; background: #fff; cursor: pointer; }
+button:hover { border-color: var(--accent); color: var(--accent); }
+
+.counts { color: var(--dim); font-size: 13px; }
+.query code { background: #fff; border: 1px solid var(--line); padding: 1px 5px; border-radius: 3px; }
+
+nav.pager { display: flex; gap: 8px; align-items: center; margin: 16px 0; flex-wrap: wrap; }
+nav.pager a, nav.pager span { padding: 3px 9px; border: 1px solid var(--line); border-radius: 4px; background: #fff; text-decoration: none; color: var(--accent); }
+nav.pager .here { background: var(--accent); color: #fff; border-color: var(--accent); }
+nav.pager .off { color: #b8c0c8; }
+
+table.kv, table.receipt { border-collapse: collapse; margin: 12px 0; background: #fff; }
+table.kv th, table.kv td, table.receipt th, table.receipt td { border: 1px solid var(--line); padding: 6px 12px; text-align: left; vertical-align: top; }
+table.kv th, table.receipt th { color: var(--dim); font-weight: 500; white-space: nowrap; }
+.pan { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+ul.leak { background: #fff; border: 1px solid var(--line); border-radius: 6px; padding: 12px 12px 12px 32px; }
+ul.leak li { margin: 4px 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+
+form.login label, form.order label { display: block; margin: 6px 0; }
+form.login input, form.order input { padding: 5px 8px; border: 1px solid var(--line); border-radius: 4px; }
+
+section.ws { margin: 16px 0; padding: 12px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+section.ws pre, pre.dump {
+  background: #0d1117;
+  color: #c9d1d9;
+  padding: 10px;
+  border-radius: 4px;
+  overflow: auto;
+  max-height: 260px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+footer {
+  margin-top: 32px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--line);
+  color: var(--dim);
+  font-size: 12px;
+  display: flex;
+  gap: 20px;
+  flex-wrap: wrap;
+}
+
+.empty { color: var(--dim); }

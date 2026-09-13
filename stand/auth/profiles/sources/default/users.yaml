@@ -1,0 +1,28 @@
+# Список логинов и паролей контура.
+#
+# Только bcrypt: открытый пароль отвергается при загрузке профиля, а не при
+# первой попытке входа. Хеш делается htpasswd -nBC 12 или любым bcrypt-12.
+#
+# Пароль демонстрационного стенда -- waf-demo-2fa, секрет TOTP -- тестовый
+# вектор RFC. В бою ни того ни другого в git быть не должно.
+
+users:
+  - login: operator
+    password: "$2a$12$RfCieXmylFauGSITCrA8L.Fx32uDoODW.7bsi4lG6eSIh5taEOzu6"
+    totp: "JBSWY3DPEHPK3PXP"
+    display: "Оператор стенда"
+    groups: [ops]
+    enabled: true
+
+  - login: auditor
+    password: "$2a$12$RfCieXmylFauGSITCrA8L.Fx32uDoODW.7bsi4lG6eSIh5taEOzu6"
+    totp: "JBSWY3DPEHPK3PXP"
+    groups: [audit]
+    enabled: true
+
+  # Выключенная запись: пароль сходится, допуска нет. Разница видна в аудите
+  # и не видна клиенту -- он получает тот же отказ, что при неверном пароле.
+  - login: retired
+    password: "$2a$12$RfCieXmylFauGSITCrA8L.Fx32uDoODW.7bsi4lG6eSIh5taEOzu6"
+    groups: []
+    enabled: false

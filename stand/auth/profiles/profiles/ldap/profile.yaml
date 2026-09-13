@@ -1,0 +1,11 @@
+# Калитка доменного входа: политика при источнике ldap.
+
+mode: enforce
+
+source: ldap
+
+gate:
+  redirect_methods: [GET, HEAD]
+  redirect_status: 303
+  deny_response: auth_required
+  html_only: true

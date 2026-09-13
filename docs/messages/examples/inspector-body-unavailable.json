@@ -1,0 +1,49 @@
+{
+  "v": 2,
+  "rid": "480000013b000000",
+  "ray": "7b21c0a8-f3e1-4d5a-8c2e-91b04f6a1d03",
+  "phase": "request",
+  "wave": 1,
+  "inspector": "modsec",
+  "deadline_ms": 18,
+  "audit_subject": "waf.audit.inspector.modsec",
+  "node": "nginx-1",
+  "conn": {
+    "client_ip": "203.0.113.77",
+    "client_port": 54233,
+    "server_ip": "10.0.0.8",
+    "server_port": 8080
+  },
+  "http": {
+    "method": "POST",
+    "scheme": "https",
+    "host": "shop.example.com",
+    "uri": "/api/orders",
+    "args_size": 0,
+    "version": "HTTP/1.1"
+  },
+  "needs": ["headers", "body"],
+  "store": {
+    "headers": {
+      "size": 64,
+      "store": "hot",
+      "driver": "redis",
+      "key": "nginx-1:480000013b000000:req:hdr"
+    },
+    "args": null,
+    "body": {
+      "unavailable": "oversize",
+      "size": 41943040,
+      "declared_size": 41943040
+    }
+  },
+  "route": {
+    "server_name": "shop.example.com",
+    "location": "/api/",
+    "profile": "default"
+  },
+  "score": {
+    "total": 0,
+    "deny_at": 100
+  }
+}

@@ -1,0 +1,10 @@
+# Большой список. us -- заглушка; t/ip-large.sh подменяет её выгрузкой GeoLite2.
+rules:
+  - set: heavy-allow
+    action: allow
+
+  - set: us
+    action: deny
+    response: blocked
+
+default: allow

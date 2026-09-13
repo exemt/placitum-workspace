@@ -1,0 +1,13 @@
+# Калитка второго фактора: стоит на маршруте второй волной после default и
+# требует полную цепочку -- сессию источника default-totp. Сам второй фактор
+# (форма кода, секреты, активный список) -- ../../sources/default-totp.
+
+mode: enforce
+
+source: default-totp
+
+gate:
+  redirect_methods: [GET, HEAD]
+  redirect_status: 303
+  deny_response: auth_required
+  html_only: true

@@ -1,0 +1,598 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://waf.local/messages/inspector.schema.json",
+  "title": "Модуль → инспектор (как пишет ngx_http_waf_msg_request)",
+  "description": "Снято с nginx/module/src/codec/ngx_http_waf_msg_req.c и ngx_http_waf_store_write. PUB waf.req.<имя>, reply-to _INBOX.waf.<node>.<pid>.<nonce>.v.<rid>.<ii>. Содержимого запроса в сообщении нет: заголовки, строка запроса и тело едут локаторами в секции store, потому что длину всех трёх задаёт клиент, а сообщение публикуется по одному на каждого инспектора волны.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "v",
+    "rid",
+    "ray",
+    "phase",
+    "wave",
+    "inspector",
+    "deadline_ms",
+    "audit_subject",
+    "node",
+    "conn",
+    "http",
+    "needs",
+    "store",
+    "route",
+    "score"
+  ],
+  "properties": {
+    "v": {
+      "type": "integer",
+      "const": 2,
+      "description": "NGX_HTTP_WAF_PROTOCOL_VERSION. Версия 2: одна секция store вместо http.headers и верхнего body, добавлены needs и audit_subject"
+    },
+    "rid": {
+      "type": "string",
+      "minLength": 16,
+      "maxLength": 16,
+      "description": "Адрес слота, 16 hex. Эхо в inbox. Без слота модуль волну не публикует"
+    },
+    "ray": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "UUID v4 запроса. Инспектор обязан вернуть его в kind=inspector"
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["request", "response", "frame"]
+    },
+    "wave": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "inspector": {
+      "type": "string",
+      "minLength": 1
+    },
+    "deadline_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Остаток бюджета фазы, сверху ограничен timeout инспектора"
+    },
+    "audit_subject": {
+      "type": ["string", "null"],
+      "description": "Куда публиковать подробности находок (kind=inspector). Приезжает с сообщением, а не зашит в инспекторе: subject — часть топологии контура. Умолчание waf.audit.inspector.<имя>, null при audit=off"
+    },
+    "node": {
+      "type": "string",
+      "minLength": 1
+    },
+    "conn": { "$ref": "#/$defs/conn" },
+    "http": { "$ref": "#/$defs/http" },
+    "vars": {
+      "type": "object",
+      "additionalProperties": { "type": "string", "minLength": 1 },
+      "description": "Поля запроса по vars= объявления этого инспектора: стандартный набор модуля (user_agent, referer, xff, accept_language, origin, content_type, accept, request_id) и waf_var. Непустые; значение режется до 256 байт по границе UTF-8 — тем же пределом, что в аудите. Секции нет без vars= и когда все выбранные пустые"
+    },
+    "needs": {
+      "type": "array",
+      "description": "Что инспектор заявил на этом маршруте, уже пересечённое с waf_capture. Едет в сообщении, чтобы инспектору не держать копию конфигурации у себя",
+      "items": { "type": "string", "enum": ["headers", "args", "body"] },
+      "uniqueItems": true
+    },
+    "store": { "$ref": "#/$defs/store" },
+    "request_store": {
+      "$ref": "#/$defs/store",
+      "description": "Объекты фазы запроса на фазах response и frame. store в этих сообщениях описывает объекты текущей фазы, а контекст запроса нужен инспектору, чтобы восстановить его, не храня состояния между сообщениями. На фазе запроса секции нет"
+    },
+    "response": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "upstream_ms"],
+      "description": "Только фаза response: код и время ответа приложения. Заголовки инлайном едут только там, где снимка заголовков ответа нет (store.headers пуст): тогда set-cookie из списка выброшен -- маскировать его нечем. Со снимком инспектор читает объект обменника, к которому применены mask= и deny=. ngx_http_waf_msg_response",
+      "properties": {
+        "status": { "type": "integer", "minimum": 100, "maximum": 599 },
+        "upstream_ms": { "type": "integer", "minimum": 0 },
+        "headers": {
+          "type": "array",
+          "description": "Пары [имя, значение] в порядке headers_out",
+          "items": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 2,
+            "maxItems": 2
+          }
+        }
+      }
+    },
+    "resume": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["token"],
+      "description": "Липкость, обе её стороны. На фазе запроса -- при keep=on на строке waf_inspect: want=true и ключ, под которым держать состояние; без keep=on секции нет, и инспектор обязан выбросить транзакцию, ответив. На потребляющей фазе -- при resume=prefer|require: тот же ключ и require, в любой subject (личный, пока продолжение живо, иначе групповой). Нет состояния под ключом: require=false -- переиграть, require=true -- отказать. Ключ называет модуль (ray): он один на запрос и переживает фазы. Липкость -- оптимизация, а не канал данных: сообщение с продолжением и без него одинаково",
+      "properties": {
+        "want": {
+          "type": "boolean",
+          "description": "Только фаза запроса: держать состояние, поздняя фаза за ним вернётся"
+        },
+        "token": { "type": "string" },
+        "require": {
+          "type": "boolean",
+          "description": "Только потребляющие фазы: без состояния отказать (true, resume=require), а не переиграть (false, resume=prefer)"
+        }
+      }
+    },
+    "route": { "$ref": "#/$defs/route" },
+    "score": { "$ref": "#/$defs/scoreState" },
+    "prior": {
+      "type": "array",
+      "description": "Что высказали предыдущие волны: кто, на какой фазе, что решил и о чём просит. Есть только если кто-то уже ответил; своих записей инспектор не получает, записей пассивных не получает никто. Ключ записи -- inspector + phase: инспектор отвечает раз за фазу, поэтому записей у него столько, на скольких фазах он стоял. ngx_http_waf_msg_prior, форма и пределы -- inspector-actions.md",
+      "items": { "$ref": "#/$defs/prior" }
+    },
+    "sessions": {
+      "type": "array",
+      "description": "Кого соседи узнали на этом запросе: секция sessions их реплаев, которую модуль держит на запросе и возвращает следующим волнам и фазам. Сквозная по фазам, как prior: личность, названная на фазе запроса, едет и на ответ, и на кадры. Заведена для тех, кто ключует свой счёт личностью: заголовок X-WAF-User ложится в запрос на apply, то есть после всех волн, а снимок заголовков снят раньше. Своих записей инспектор не получает, записей пассивных не получает никто; до восьми записей на запрос. ngx_http_waf_msg_sessions, форма -- verdict-protocol.md#секция-sessions",
+      "items": { "$ref": "#/$defs/session" }
+    }
+  },
+  "$defs": {
+    "conn": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["client_ip", "client_port"],
+      "properties": {
+        "client_ip": {
+          "type": "string",
+          "description": "r->connection->addr_text после realip"
+        },
+        "client_port": { "type": "integer" },
+        "server_ip": {
+          "type": "string",
+          "description": "Только если ngx_connection_local_sockaddr == OK"
+        },
+        "server_port": { "type": "integer" },
+        "tls": {
+          "type": "object",
+          "description": "Только если c->ssl != NULL. ja4 модуль не пишет",
+          "additionalProperties": false,
+          "required": ["version"],
+          "properties": {
+            "version": { "type": ["string", "null"] },
+            "sni": { "type": "string" }
+          }
+        }
+      }
+    },
+    "http": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "scheme", "uri", "args_size"],
+      "properties": {
+        "method": { "type": "string" },
+        "scheme": { "type": "string", "enum": ["http", "https"] },
+        "host": {
+          "type": "string",
+          "description": "Нет, если r->headers_in.server пуст"
+        },
+        "uri": {
+          "type": "string",
+          "description": "Путь без строки запроса, инлайном. Единственное содержимое запроса в сообщении: путь нужен каждому инспектору для сопоставления правил, а вынос его в обменник сделал бы round-trip обязательным даже для тех, кому обменник не нужен вовсе. Верхняя граница длины — large_client_header_buffers, и она проверяется против max_payload шины при nginx -t"
+        },
+        "args_size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Длина строки запроса в байтах. Содержимое — в store.args. Ноль означает, что query не было: это видно даже когда запись выключена"
+        },
+        "version": {
+          "type": "string",
+          "description": "Нет, если r->http_protocol пуст"
+        }
+      }
+    },
+    "store": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["headers", "args", "body"],
+      "description": "Три объекта одной формы. Та же секция и та же форма локатора, что в store агентского сообщения: разбирается одним кодом и у инспектора, и у логера. Объект, которого инспектор не просил в needs, получает null, даже когда он лежит для других",
+      "properties": {
+        "headers": { "$ref": "#/$defs/locator" },
+        "args": {
+          "description": "Строка запроса как пришла, без разбора на пары: кодировки, повторяющиеся ключи, ; против & — это интерпретация, и модуль, выбрав одну, навязал бы её всем",
+          "$ref": "#/$defs/locator"
+        },
+        "body": { "$ref": "#/$defs/locator" }
+      }
+    },
+    "locator": {
+      "description": "null — объект не клали: инспектор его не просил, маршрут его не снимает, либо класть было нечего. Иначе размещённый объект либо признак недоступности",
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "#/$defs/placed" },
+        { "$ref": "#/$defs/unavailable" }
+      ]
+    },
+    "placed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["size"],
+      "properties": {
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Сколько байт лежит в обменнике. У тела расходится с полной длиной при усечении и при body=preview"
+        },
+        "sha256": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "description": "Только у тела. Считается по телу целиком независимо от того, сколько из него легло: связывает событие с архивом"
+        },
+        "complete": {
+          "type": "boolean",
+          "description": "Только у тела"
+        },
+        "truncated": {
+          "type": "boolean",
+          "description": "Только у тела. true при waf_body_limit и при уровне ниже full"
+        },
+        "encoding": {
+          "type": "string",
+          "description": "Только у тела: Content-Encoding как пришёл"
+        },
+        "store": {
+          "type": "string",
+          "description": "Ярус хранения, а не имя экземпляра: \"hot\" -- горячий waf_store, \"archive\" ставит агент после переноса в S3. Полей адресации нет вовсе при body=meta: длину, хеш и кодировку просили, содержимого не просили, и в обменник идти незачем"
+        },
+        "driver": { "type": "string" },
+        "key": { "type": "string" },
+        "expires_at": {
+          "type": "integer",
+          "description": "Нет, если loc->expires_at == 0"
+        },
+        "hint": {
+          "type": "string",
+          "description": "Адрес узла хранилища, ставит драйвер"
+        }
+      }
+    },
+    "unavailable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unavailable", "size"],
+      "properties": {
+        "unavailable": {
+          "type": "string",
+          "enum": [
+            "oversize",
+            "store_error",
+            "store_unconfigured",
+            "streaming_not_supported",
+            "transform_failed"
+          ]
+        },
+        "size": { "type": "integer", "minimum": 0 },
+        "declared_size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Только у тела: Content-Length, как его объявил клиент"
+        }
+      }
+    },
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["server_name", "location", "profile"],
+      "properties": {
+        "server_name": { "type": "string" },
+        "location": { "type": "string" },
+        "profile": {
+          "type": "string",
+          "description": "wlcf->profiles[i] или литерал default"
+        }
+      }
+    },
+    "scoreState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "deny_at"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "deny_at": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inspector", "source", "kind"],
+      "description": "Одна личность: кто её назвал, чья она и что о ней известно. inspector проставляет модуль -- с провода имя отправителя не принимается. Ключом счёта потребители берут только verified: непроверенная запись -- это то, что прислал клиент",
+      "properties": {
+        "inspector": {
+          "type": "string",
+          "description": "Имя объявления, чей реплай её принёс"
+        },
+        "source": {
+          "type": "string",
+          "description": "Имя источника у отправителя: у калитки -- источник входа"
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["own", "jwt", "app"],
+          "description": "own -- выписал контур, jwt -- чужой токен, app -- кука приложения"
+        },
+        "user": {
+          "type": "string",
+          "description": "Логин; пусто -- сессия есть, а кто это, отправитель не знает"
+        },
+        "id": {
+          "type": "string",
+          "description": "Идентификатор сессии, не сама кука: у своей -- sid, у чужой -- хеш"
+        },
+        "verified": {
+          "type": "boolean",
+          "description": "Подпись сошлась. false у разбора без ключа: claims в такой записи написал клиент"
+        },
+        "groups": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Имена групп допуска, как их назвал отправитель"
+        },
+        "issued": { "type": "integer" },
+        "expires": { "type": "integer" }
+      }
+    },
+    "prior": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["inspector", "phase", "verdict"],
+      "description": "Одно высказывание: кто, где, что решил и о чём просит. Все поля, кроме actions, проставляет модуль -- с провода не принимаются ни имя, ни фаза. Записей пассивного отправителя здесь нет вовсе: пассивный не должен влиять на трафик чужими руками, а режим, который держится на умолчании в чужом профиле, -- не режим. Что он сказал, видно в аудите",
+      "properties": {
+        "phase": {
+          "type": "string",
+          "enum": ["request", "response", "frame"],
+          "description": "На какой фазе высказался. Секция сквозная по фазам: на response и frame приезжают и записи фазы запроса, иначе просьба, высказанная на запросе, не дожила бы до адресата, которого на фазе запроса нет"
+        },
+        "wave": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Номер волны внутри фазы. Нужен затем же, зачем phase: понять, что было известно на момент высказывания"
+        },
+        "inspector": {
+          "type": "string",
+          "description": "Кто высказался. Имя из реестра, по номеру инспектора в волне"
+        },
+        "verdict": {
+          "type": "string",
+          "enum": ["allow", "score", "redirect", "deny", "error"],
+          "description": "deny встречается почти никогда: разрешение вердикта обрывает фазу, и до следующей волны запрос не доезжает. error -- участник не смог проверить: не вердикт, а признанное его отсутствие, повод в reason.code"
+        },
+        "score": {
+          "type": "integer",
+          "description": "Что легло в сумму фазы: при verdict=score -- как прислал инспектор; у совещательного (mode=vote) с verdict=deny -- 100. Множителя на маршруте нет, поэтому число одно"
+        },
+        "reason": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code"],
+          "description": "Печатается, если инспектор прислал код и тот не длиннее 64 байт",
+          "properties": { "code": { "type": "string", "maxLength": 64 } }
+        },
+        "actions": {
+          "type": "array",
+          "description": "ДОГОВОР, СЕРИАЛИЗАТОРА ЕЩЁ НЕТ. О чём этот инспектор просит других. Модуль форму проверяет, но действий не исполняет: ни счёт, ни порог, ни вердикт от них не меняются. Приезжают только адресованные читающему и широковещательные",
+          "items": { "$ref": "#/$defs/action" }
+        }
+      }
+    },
+    "record_object": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Объект просьбы записи (headers / args / body) при do=audit или do=archive с set on -- как строка директивы, объект за объектом. Названный объект входит в набор: у archive -- в набор агенту (никого не назвали -- набор waf_archive маршрута, а без него всё снятое), у audit -- в превью записи. set off исключает объект. limit: у archive -- сколько байт уедет, у audit -- бюджет превью объекта; ноль и отсутствие -- весь (у audit -- до потолка датаграммы, сумма прижимается к нему). source: store -- как снято, срез и маски снимка; original -- оригинал, модуль перекладывает объект в обменник заново без масок (reload), тело дочитывается. Объект, которого нет в обменнике этой фазы, молча опускается",
+      "properties": {
+        "set": { "type": "string", "enum": ["on", "off"] },
+        "limit": { "type": "integer", "minimum": 0, "maximum": 1073741824 },
+        "source": { "type": "string", "enum": ["store", "original"] }
+      }
+    },
+    "action": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["do", "apply"],
+      "allOf": [
+        {
+          "$comment": "Матрица глагол-ось и обязательные параметры. Выбор оси настоящий только у note; у остальных она одна, но пишется всё равно -- одна форма записи, одна проверка в модуле, одна строка в аудите. Реестр для панели и API -- controller/src/model/actions.ts, он сверяется с этими блоками тестом.",
+          "if": { "properties": { "do": { "const": "challenge" } }, "required": ["do"] },
+          "then": { "properties": { "apply": { "const": "request" } } }
+        },
+        {
+          "if": { "properties": { "do": { "const": "skip" } }, "required": ["do"] },
+          "then": { "properties": { "apply": { "const": "request" } } }
+        },
+        {
+          "if": { "properties": { "do": { "const": "threshold" } }, "required": ["do"] },
+          "then": {
+            "properties": { "apply": { "const": "request" } },
+            "required": ["delta"]
+          }
+        },
+        {
+          "if": { "properties": { "do": { "const": "reauth" } }, "required": ["do"] },
+          "then": { "properties": { "apply": { "const": "session" } } }
+        },
+        {
+          "if": { "properties": { "do": { "const": "note" } }, "required": ["do"] },
+          "then": {
+            "properties": {
+              "apply": { "enum": ["request", "ip", "asn", "session"] }
+            }
+          }
+        },
+        {
+          "$comment": "У mutate обе величины обязательны: что переключить и куда, называет отправитель, как корзину у note; правило приёма получателя решает, дают ли ему это, а не что.",
+          "if": { "properties": { "do": { "const": "mutate" } }, "required": ["do"] },
+          "then": { "properties": { "apply": { "const": "request" } }, "required": ["group", "set"] }
+        },
+        {
+          "if": { "properties": { "do": { "not": { "const": "mutate" } } }, "required": ["do"] },
+          "then": { "not": { "required": ["group"] } }
+        },
+        {
+          "$comment": "Сторона set общая у mutate и глаголов записи: у первого -- куда переключить группу, у вторых -- писать или нет. Остальным глаголам её не бывает.",
+          "if": { "properties": { "do": { "not": { "enum": ["mutate", "audit", "archive"] } } }, "required": ["do"] },
+          "then": { "not": { "required": ["set"] } }
+        },
+        {
+          "$comment": "Управляющие глаголы -- режим вызова соседа (те же слова, что у waf_inspect … mode=); исполняет модуль в адрес вызова на маршруте от любого инспектора, спрошенного на нём. Ось request -- до конца транзакции (на кадрах -- этого кадра), conn -- до конца соединения кадров; вне кадров conn отбраковывает ответ. Адресат обязателен.",
+          "if": { "properties": { "do": { "const": "active" } }, "required": ["do"] },
+          "then": { "properties": { "apply": { "enum": ["request", "conn"] } }, "required": ["to"] }
+        },
+        {
+          "if": { "properties": { "do": { "const": "passive" } }, "required": ["do"] },
+          "then": { "properties": { "apply": { "enum": ["request", "conn"] } }, "required": ["to"] }
+        },
+        {
+          "if": { "properties": { "do": { "const": "off" } }, "required": ["do"] },
+          "then": { "properties": { "apply": { "enum": ["request", "conn"] } }, "required": ["to"] }
+        },
+        {
+          "if": { "properties": { "do": { "const": "vote" } }, "required": ["do"] },
+          "then": { "properties": { "apply": { "enum": ["request", "conn"] } }, "required": ["to"] }
+        },
+        {
+          "$comment": "Глаголы записи -- переопределить журнал и архив: ось называет запись -- request (запроса; на кадрах -- этого кадра, а просьба с рукопожатия действует на все кадры соединения) либо response (ответа этой транзакции; у неё нет args, и с кадра она отброшена). У каждой записи своё переопределение, назначить обе можно с любой фазы. Исполняет модуль от любого инспектора, спрошенного на маршруте; адресат -- запись самого маршрута, поля to нет. Сторона обязательна; объекты headers/args/body -- у обоих при set on, каждый со своей стороной, размером и источником; срок и исход -- только у archive.",
+          "if": { "properties": { "do": { "const": "audit" } }, "required": ["do"] },
+          "then": { "properties": { "apply": { "enum": ["request", "response"] } }, "required": ["set"], "not": { "anyOf": [ { "required": ["to"] }, { "required": ["ttl"] }, { "required": ["when"] } ] } }
+        },
+        {
+          "if": { "properties": { "do": { "const": "archive" } }, "required": ["do"] },
+          "then": { "properties": { "apply": { "enum": ["request", "response"] } }, "required": ["set"], "not": { "required": ["to"] } }
+        },
+        {
+          "$comment": "Срок -- только у archive: сколько хранить объекты, секундами. Исходы when -- тоже только у archive.",
+          "if": { "properties": { "do": { "not": { "const": "archive" } } }, "required": ["do"] },
+          "then": { "not": { "required": ["ttl"] } }
+        },
+        {
+          "if": { "properties": { "do": { "not": { "const": "archive" } } }, "required": ["do"] },
+          "then": { "not": { "required": ["when"] } }
+        },
+        {
+          "$comment": "mark -- маркер записи: адресат тот же, что у глаголов записи (запись самого маршрута), поля to нет; прятать меткой нечего, и байтов она не стоит. Строка обязательна: «пометить» без метки не просьба. Ось одна -- request: эта транзакция, на кадрах -- этот кадр (маркер с рукопожатия наследуют все кадры соединения).",
+          "if": { "properties": { "do": { "const": "mark" } }, "required": ["do"] },
+          "then": { "properties": { "apply": { "const": "request" } }, "required": ["marker"], "not": { "required": ["to"] } }
+        },
+        {
+          "$comment": "Очки на маршруте: value со знаком к сумме фазы этого запроса (на кадрах -- кадра). Исполняет модуль при приёме от любого спрошенного, кроме пассивного; адресат -- сумма самого маршрута, поля to нет.",
+          "if": { "properties": { "do": { "const": "score" } }, "required": ["do"] },
+          "then": { "properties": { "apply": { "const": "request" }, "value": { "minimum": -100, "maximum": 100 } }, "required": ["value"], "not": { "required": ["to"] } }
+        },
+        {
+          "if": { "properties": { "do": { "not": { "const": "mark" } } }, "required": ["do"] },
+          "then": { "not": { "required": ["marker"] } }
+        },
+        {
+          "if": { "properties": { "do": { "not": { "enum": ["audit", "archive"] } } }, "required": ["do"] },
+          "then": { "not": { "anyOf": [ { "required": ["headers"] }, { "required": ["args"] }, { "required": ["body"] } ] } }
+        },
+        {
+          "if": { "properties": { "do": { "enum": ["audit", "archive"] }, "set": { "const": "off" } }, "required": ["do", "set"] },
+          "then": { "not": { "anyOf": [ { "required": ["ttl"] }, { "required": ["when"] }, { "required": ["headers"] }, { "required": ["args"] }, { "required": ["body"] } ] } }
+        },
+        {
+          "$comment": "Параметр принадлежит своему глаголу: delta -- только у threshold, value -- только у note. Чужой параметр не игнорируется, а отбраковывает ответ: «note с delta» -- не половина смысла, а признак того, что отправитель имел в виду не то, что написал.",
+          "if": { "properties": { "do": { "not": { "const": "threshold" } } }, "required": ["do"] },
+          "then": { "not": { "required": ["delta"] } }
+        },
+        {
+          "$comment": "value общий у note и score: доля шкалы получателя у первого, очки к сумме маршрута у второго; корзина -- только у note.",
+          "if": { "properties": { "do": { "not": { "enum": ["note", "score"] } } }, "required": ["do"] },
+          "then": { "not": { "required": ["value"] } }
+        },
+        {
+          "if": { "properties": { "do": { "not": { "const": "note" } } }, "required": ["do"] },
+          "then": { "not": { "required": ["counter"] } }
+        },
+        {
+          "$comment": "Фаза вызова адресата -- адрес управляющего глагола: у имени, стоящего на двух фазах, вызова два, и без поля режим получают оба. У прочих глаголов адресат -- процесс либо запись маршрута, фазы у них нет.",
+          "if": { "properties": { "do": { "not": { "enum": ["active", "passive", "vote", "off"] } } }, "required": ["do"] },
+          "then": { "not": { "required": ["phase"] } }
+        }
+      ],
+      "description": "Просьба к соседу, а не команда: исполнить или нет решает профиль получателя. Поля to в доставленном действии нет -- адресат тот, кто читает, и широковещательное от адресного он не отличает",
+      "properties": {
+        "do": {
+          "type": "string",
+          "enum": ["challenge", "threshold", "skip", "reauth", "note", "mutate", "active", "passive", "vote", "off", "audit", "archive", "mark", "score"],
+          "description": "challenge -- провести проверку; threshold -- сдвинуть свой собственный порог на delta; skip -- не проверять этот запрос; reauth -- потребовать повторную аутентификацию; note -- ничего не просит, сообщает факт; mutate -- переключить группу модификаторов ответа у получателя: какую и куда, называет отправитель полями group и set, а правило приёма получателя решает, дают ли ему это. Управляющие -- режим вызова соседа, исполняет модуль, а не сосед: active -- спрашивать и гейтить, passive -- спрашивать ради лога, vote -- спрашивать ради очков (совещательный голос: очки в сумму, deny как 100, сам не решает), off -- не спрашивать на оставшихся волнах. Принимаются от любого инспектора, спрошенного на маршруте. Глаголы записи -- audit и archive (журнал и архив маршрута) и mark -- маркер на записи этого запроса: произвольная строка оператора, по которой события ищут и группируют. score -- очки на маршруте: value со знаком к сумме фазы, исполняет модуль, адресат -- сам маршрут (поля to нет). Глагола «заблокировать» нет: блокировка -- это вердикт, и он у инспектора свой"
+        },
+        "apply": {
+          "type": "string",
+          "enum": ["request", "response", "ip", "asn", "session", "conn"],
+          "description": "Ось: о ком высказывание, а не какой рычаг у получателя дёрнуть. У глаголов записи audit и archive ось называет запись -- request (запроса) либо response (ответа этой транзакции). Отправитель не знает ни его порогов, ни того, какую подсеть тот берёт из адреса и какую cookie считает сессией -- ось в ключ превращает получатель. Обязательна даже там, где допустима одна: умолчание означало бы, что «про кого это сказано» иногда написано, а иногда угадано. Допустимые пары: challenge, skip, threshold, mutate -- request; reauth -- session; note -- любая из четырёх; управляющие active, passive, vote, off -- request либо conn (срок, а не субъект: до конца транзакции или соединения кадров). Ось не для этого глагола -- отбраковка ответа, как всякая битая форма"
+        },
+        "phase": {
+          "type": "string",
+          "enum": ["request", "response", "frame"],
+          "description": "Только у управляющих active, passive, vote, off: вызову какой фазы адресата ставить режим. Адресат глагола -- вызов, а не процесс: имя, стоящее на запросе и на ответе, звано дважды, и без поля режим получают оба вызова; с полем -- вызов названной фазы (frame -- обе стороны кадров). Адресат обязан стоять на маршруте в названной фазе, иначе просьба отброшена с предупреждением в лог. С осью conn -- только frame либо без поля: до конца соединения живут одни кадры. У прочих глаголов поля не бывает -- отбраковка ответа. В записи аудита то же поле печатается как to_phase: phase там уже значит, где высказано"
+        },
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]*$",
+          "maxLength": 64,
+          "description": "Машинный повод. Модуль его не толкует, поэтому новый код не требует ни правки модуля, ни перезагрузки nginx. Частности живут здесь: ip не обязан знать, как у modsec называются правила"
+        },
+        "delta": {
+          "type": "integer",
+          "minimum": -1000,
+          "maximum": 1000,
+          "description": "Только при do=threshold. Проценты коэффициента к измерению получателя (множитель 1+delta/100), осмысленный диапазон -100..+900: минус -- скидка, плюс -- строже. Цена знака -- правило приёма в профиле получателя с именем отправителя: широковещательное не грузится, а принятая просьба берётся целиком, получатель прижимает только сумму"
+        },
+        "value": {
+          "type": "integer",
+          "minimum": -1000,
+          "maximum": 1000,
+          "description": "При do=note -- проценты изменения счётчика получателя, осмысленный диапазон -100..+100: плюс пополняет долей порога счётчика, минус снимает долю накопленного, -100 обнуляет; знак выбирает отправитель, поэтому правило приёма требует имени. При do=score -- очки к сумме фазы маршрута со знаком, -100..+100, обязателен и не ноль: исполняет модуль, вклад отправителя сдвигается в пределах сотни, сумма ниже нуля не уходит"
+        },
+        "counter": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "maxLength": 64,
+          "description": "Только при do=note. Какую из шкал получателя менять -- селектор поверх правила приёма, а не адрес: правило остаётся грантом, и просьба с именем корзины, которого нет ни в одном правиле отправителя, не применяется. Пусто -- корзину называет правило"
+        },
+        "group": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+          "maxLength": 64,
+          "description": "Только при do=mutate, обязательно. Имя группы модификаторов получателя, которую просят переключить. Модуль имя не толкует: есть ли такая группа, знает получатель, а дают ли отправителю её трогать -- его правило приёма"
+        },
+        "marker": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^\u0000-\u0020\u007f](?:[^\u0000-\u001f\u007f]*[^\u0000-\u0020\u007f])?$",
+          "description": "Только при do=mark, обязательно. Метка события: произвольная строка, которую называет оператор в профиле отправителя, -- модуль её не толкует и не разбирает. Складывается со всеми маркерами запроса в множество (повтор строки -- один маркер), уезжает массивом в запись аудита, и по ней события ищут и группируют. Без управляющих символов и крайних пробелов, до 128 байт; длиннее -- отбраковка ответа, как всякая битая форма"
+        },
+        "ttl": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 315360000,
+          "description": "Только при do=archive с set on. Срок объектов в архиве секундами, как ttl= у waf_archive; ноль -- хранить вечно. Без поля -- срок маршрута, а у объекта, не названного в waf_archive, -- вечно"
+        },
+        "when": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["allow", "deny"] },
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "description": "Только при do=archive с set on. На каких исходах маршрута просьбу исполнять, как when= у waf_archive: allow, deny или оба (всё, кроме перенаправления). Без поля -- на любом исходе, включая перенаправление: просьба сильнее when= маршрута, о котором отправитель не знает. Исход берётся маршрутный, по последней фазе, ради чего запись запроса на маршруте с поздней фазой и ждёт исхода. Не подошёл -- архива нет вовсе, в том числе у объектов, которые маршрут увёз бы сам"
+        },
+        "headers": { "$ref": "#/$defs/record_object" },
+        "args": { "$ref": "#/$defs/record_object" },
+        "body": { "$ref": "#/$defs/record_object" },
+        "set": {
+          "type": "string",
+          "enum": ["on", "off"],
+          "description": "Только при do=mutate, обязательно. Куда переключить группу на этом запросе: on -- применить, off -- не применять. Повтор с той же группой заменяет прежнюю просьбу"
+        }
+      }
+    }
+  }
+}

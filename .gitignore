@@ -1,0 +1,85 @@
+# Рабочее место placitum: всё, что не едет клиенту. Компоненты — свои репозитории:
+# клоны лежат рядом, каждый на своей ветке.
+/core/
+/shared/
+/node/
+/controller/
+/logger/
+/crypto/
+/geo/
+/keeper/
+/agents/
+/ip/
+/action/
+/auth/
+/captcha/
+/cookie/
+/counter/
+/json/
+/modsec/
+/rewrite/
+/vlai/
+
+# Журналы прогонов стенда.
+/logs/
+
+# Личные заметки и реквизиты серверов: в git не кладём, как и в монорепе.
+/private/
+
+# Зависимости и сборки
+node_modules/
+dist/
+*.log
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.tsbuildinfo
+
+# Веса моделей, чекпоинты и кеши
+checkpoint/
+cache/
+hf/
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.gguf
+*.ckpt
+*.h5
+*.mmdb
+
+# Дампы и тяжёлые данные
+stand/db-*-backup-*.sql
+e2e/loadgen/.tools/
+*.exe
+*.zip
+
+# Секреты и локальное окружение (см. stand/secrets/.gitignore)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.hmac
+*.creds
+stand/secrets/*
+!stand/secrets/.gitignore
+!stand/secrets/gen.mjs
+
+# Артефакты прогонов
+e2e/.baseline/
+e2e/reports/
+e2e/runner/reports/*
+!e2e/runner/reports/.gitignore
+
+# Личные настройки
+.claude/settings.local.json
+
+# ОС и редакторы
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

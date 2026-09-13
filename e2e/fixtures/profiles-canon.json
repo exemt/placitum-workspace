@@ -1,0 +1,19 @@
+{
+  "note": "Канон config_hash профилей: контроллер (TypeScript) и инспекторы (Go) обязаны получить из этого дерева один и тот же hex. Тексты подобраны так, чтобы разъехались реализации, а не совпали случайно: <, &, кавычки, кириллица, эмодзи, CRLF, хвостовой перевод строки и его отсутствие, пустой файл. Правка этого файла ломает оба теста разом -- так и задумано.",
+  "expect": "sha256:49eda6bd359f2760892d7adbeffd17c929cd24f3d70fadfc128d4370918633e4",
+  "profiles": {
+    "shop": {
+      "files": [
+        { "name": "00-engine.conf", "text": "SecRuleEngine On\n" },
+        { "name": "10-amp.conf", "text": "SecRule ARGS \"@rx a<b&c\" \"id:1,phase:2,deny\"\r\n" }
+      ]
+    },
+    "default": {
+      "files": [
+        { "name": "00-engine.conf", "text": "SecRuleEngine On\n" },
+        { "name": "20-utf8.conf", "text": "# правило с кириллицей и эмодзи 🛡\nSecRule ARGS \"@contains пароль\" \"id:2,phase:2,log\"" },
+        { "name": "30-empty.conf", "text": "" }
+      ]
+    }
+  }
+}

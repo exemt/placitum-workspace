@@ -1,0 +1,1901 @@
+# Конфигурация локального окружения: инспекторы на шине NATS
+# (ip, modsec), каталог отказов, порог счёта и режимы на маршруте.
+#
+# Дефолтный набор -- ip: из сети compose $remote_addr в allowlist, отказ
+# задаётся X-Forwarded-For на маршрутах с realip. Тело читает modsec на
+# /body/* и /modsec*.
+# vlai временно снят: объявления нет, маршруты /vlai* без модели.
+#
+# Контент отдаётся статикой, а не через return: директива return принадлежит
+# rewrite-модулю и срабатывает в NGX_HTTP_REWRITE_PHASE, то есть ДО access-фазы,
+# и обработчик модуля в таком location не вызывается вовсе. По той же причине
+# страницы отдаются через try_files: precontent-фаза идёт после access.
+#
+# /app/ -- отдельный маршрут: там за модулем стоит настоящий апстрим
+# (../../backend), а не статика, и через него проверяется собственно
+# проксирование запроса и ответа -- заголовки, тело, коды, потоковая отдача,
+# зависшее соединение. Вердикт там тот же ip: частная сеть проходит,
+# X-Forwarded-For из blocklist -- нет.
+
+load_module modules/ngx_http_waf_module.so;
+
+# Не auto: в контейнере видны все ядра хоста, а квота compose -- 2 CPU.
+# auto снова поднял бы 16 воркеров на ноду.
+worker_processes  2;
+
+# Уровень главного лога, а не того, что в http: всё, что модуль пишет вне
+# запроса -- подключение к шине, подписки на наборы данных, состояние
+# предохранителя, -- идёт в лог цикла, а он по умолчанию отсекает всё ниже
+# error. Без этой строки успешная подписка на поток набора выглядит как её
+# отсутствие.
+error_log  /var/log/nginx/error.log  info;
+
+events {
+    worker_connections  4096;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    # В официальном образе оба файла -- симлинки на stdout и stderr, поэтому
+    # логи видны в docker compose logs.
+    #
+    # Уровень info, а не notice: построчная раскладка ответов инспекторов
+    # (включая пассивные) пишется именно на нём, а debug требует nginx,
+    # собранного с --with-debug.
+    access_log  /var/log/nginx/access.log;
+    error_log   /var/log/nginx/error.log  info;
+
+    # Вторая копия тех же логов -- агенту, в unix-датаграмму рядом с сокетом
+    # вердиктов. Агент разбирает шапку syslog и кладёт строки в waf.log, откуда
+    # их показывает раздел «Логи» контроллера.
+    #
+    # Копия, а не перенос: файл в образе -- симлинк на stdout, и
+    # `docker compose logs nginx-1` остаётся первым, куда смотрят, в том числе
+    # когда лежит сам контур доставки.
+    #
+    # tag= -- это и есть колонка service. Один тег на оба лога: строка запроса
+    # и строка ошибки приезжают от одного сервиса, а различает их уровень.
+    #
+    # warn, а не info: на info модуль пишет построчную раскладку ответов
+    # инспекторов, и под нагрузкой это тысячи строк в секунду на ноду. В файле
+    # уровень остаётся info -- там их читают глазами и по одному прогону.
+    access_log  syslog:server=unix:/var/run/waf/log.sock,tag=nginx,nohostname;
+    error_log   syslog:server=unix:/var/run/waf/log.sock,tag=nginx,nohostname warn;
+
+    sendfile      on;
+    keepalive_timeout  65;
+
+    # k6 добирает query и x-load-pad до 256k. Строка запроса обязана
+    # уместиться в один large buffer, остальные заголовки — в следующие.
+    # nginx -t считает худший inspect-пакет от размера буфера (Host/uri
+    # и encoding локатора), поэтому в nodes/*.conf payload_max=16m.
+    # На проводе пакет остаётся маленьким: query в сообщении нет, только
+    # args_size, а x-load-pad уезжает в Redis.
+    client_header_buffer_size 32k;
+    large_client_header_buffers 4 512k;
+
+    # Разрешение имён на запросе -- встроенный DNS docker. Нужен серверам
+    # тренировочных приложений в конце файла: имя в блоке upstream nginx
+    # разрешает при старте, и остановленный контейнер приложения означал бы
+    # "host not found in upstream", то есть упавший край и весь стенд следом.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
+    # Апгрейд соединения для socket.io Juice Shop: без него сокет отваливается
+    # и SPA переходит на опрос.
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    # Идентичность ноды не в общем файле: три контейнера монтируют разные
+    # deploy/nginx/nodes/edge-0N.conf как /etc/nginx/waf-node.conf.
+    include /etc/nginx/waf-node.conf;
+    waf_max_inflight 4096;
+
+    # Итог фазы — локальному агенту, не на шину вердиктов.
+    waf_agent_socket /var/run/waf/verdict.sock;
+
+    # Реестр инспекторов. Что снимаем -- waf_capture на маршруте, не здесь.
+    # Два имени на один subject -- один процесс, разные profile=.
+    # timeout/weight/mode -- на waf_inspect.
+
+    # Инспектор правил SecLang (inspectors/modsec, Coraza со встроенным CRS).
+    # Тело ему даёт capture маршрута (http-дефолт -- headers args body).
+    # Он же единственный в контуре, кто тело действительно читает из
+    # хранилища -- REDIS_URL его контейнера в docker-compose.yml.
+    # Отдельного имени «crs» нет -- это тот же процесс. Свои маршруты --
+    # /modsec* и /body/*. Профили -- отдельные имена на тот же subject.
+    waf_inspector modsec          subject=waf.req.modsec;
+    waf_inspector modsec-strict   subject=waf.req.modsec profile=strict;
+    waf_inspector modsec-unknown  subject=waf.req.modsec profile=no-such-profile;
+    waf_inspector modsec-deny     subject=waf.req.modsec profile=deny;
+    waf_inspector modsec-allow    subject=waf.req.modsec profile=allow;
+    waf_inspector modsec-api      subject=waf.req.modsec profile=api;
+    waf_inspector modsec-e2e      subject=waf.req.modsec profile=e2e;
+    # Профиль фазы ответа: правило phase:4 по RESPONSE_BODY, заливает
+    # tests/runner/scenarios/response.mjs. Тот же subject: инспектор
+    # различает фазы по полю phase в сообщении.
+    waf_inspector modsec-e2e-rsp  subject=waf.req.modsec profile=e2e-rsp;
+
+    # Инспектор адреса (inspectors/ip). Ему нужен conn.client_ip, склад
+    # не обязателен. Дефолтный набор сервера -- он: из сети compose адрес
+    # в allowlist. Свои маршруты -- /ip*, адрес из X-Forwarded-For.
+    waf_inspector ip              subject=waf.req.ip;
+    waf_inspector ip-admin        subject=waf.req.ip profile=admin;
+    waf_inspector ip-ext          subject=waf.req.ip profile=ext;
+    waf_inspector ip-unknown      subject=waf.req.ip profile=no-such;
+    waf_inspector ip-heavy        subject=waf.req.ip profile=heavy;
+
+    # Калитка второго фактора (inspectors/auth). Ей нужен склад: cookie
+    # сессии едет в store.headers, инлайном заголовки не ходят. Отсюда и
+    # timeout=20ms вместо 10ms -- в бюджете лежит GET в Redis. Свои
+    # маршруты -- /auth/ (пароль плюс TOTP) и /auth-code/ (общий код).
+    waf_inspector auth            subject=waf.req.auth;
+    waf_inspector auth-code       subject=waf.req.auth profile=code;
+    waf_inspector auth-observe    subject=waf.req.auth profile=observe;
+    # Тот же процесс, профиль с проверкой пароля в каталоге: контейнер ldap.
+    waf_inspector auth-ldap       subject=waf.req.auth profile=ldap;
+    # И он же со списком логинов вместо каталога: тот же процесс, тот же
+    # subject, другой набор факторов в профиле.
+    waf_inspector auth-list       subject=waf.req.auth profile=list;
+    # Второй фактор -- отдельная калитка того же процесса: профиль
+    # default-totp спрашивает только код, личность берёт из сессии default.
+    # На маршруте стоит второй волной после auth.
+    waf_inspector auth-totp       subject=waf.req.auth profile=default-totp;
+
+    # Капча (inspectors/captcha): свой процесс, свой ключ, свой subject. Тот же
+    # склад, что у калитки: cookie клиренса едет в store.headers. Маршруты --
+    # /captcha/ (профиль login: виджет каждому без клиренса) и
+    # /captcha-observe/ (allow всегда, решение в аудите).
+    waf_inspector captcha         subject=waf.req.captcha;
+    waf_inspector captcha-login   subject=waf.req.captcha profile=login;
+    waf_inspector captcha-observe subject=waf.req.captcha profile=observe;
+    waf_inspector captcha-cluster subject=waf.req.captcha profile=cluster;
+
+    # Контракт API (inspectors/json): тело и вызов сверяются с OpenAPI. Один
+    # процесс, четыре профиля -- гейт на запросе (api), белый список путей и
+    # гейт на ответе (strict), наблюдение (observe) и мягкий (soft), где
+    # усечённое тело проходит. Профиль называет и base_path, поэтому у каждого
+    # свой маршрут: срезаемый префикс обязан совпасть с location.
+    waf_inspector json            subject=waf.req.json profile=api;
+    waf_inspector json-strict     subject=waf.req.json profile=strict;
+    waf_inspector json-observe    subject=waf.req.json profile=observe;
+    waf_inspector json-soft       subject=waf.req.json profile=soft;
+
+    # Счётчик (inspectors/counter): фаза ответа меряет ответы в корзины на
+    # Redis, фаза запроса судит по уровням. Обе фазы -- одно имя и один
+    # subject, ветка по phase в сообщении.
+    waf_inspector counter         subject=waf.req.counter profile=stand;
+
+    # Канал ответа: запретный список заголовков + санитайз значений.
+    # Белых списков allow_headers / allow_cookies больше нет.
+
+    # Каталог отказов. Инспектор присылает имя записи, а не статус и тело: что
+    # именно увидит клиент при отказе, решает контур.
+    waf_deny_response blocked    status=403;
+    waf_deny_response suspicious status=403;
+    # Имя из status_map.yaml инспектора правил: нарушение формата запроса -- это
+    # 400, а не 403. Записи с таким именем в каталоге могло бы и не быть, тогда
+    # модуль подставил бы waf_deny_response_default; она здесь ровно затем, чтобы
+    # разница между «запрос запрещён» и «запрос не разобран» дошла до клиента.
+    waf_deny_response malformed  status=400;
+    # Превышение частоты -- это 429, а не 403: клиент может исправить это сам,
+    # и разница должна до него доходить. Отдельная запись каталога затем и
+    # нужна, чтобы локальный лимит не отвечал тем же, чем отвечает блокировка.
+    waf_deny_response too_many   status=429;
+    # Нет второго фактора -- это 401, а не 403: клиент может исправить это
+    # сам, войдя. Калитка отвечает так всему, что не является навигацией:
+    # редирект на форму отобрал бы у POST тело, а у fetch -- ответ.
+    waf_deny_response auth_required status=401;
+    # Нет клиренса капчи и это не навигация -- 403 с машиночитаемым телом:
+    # фронтенд читает из него адрес задания и показывает виджет сам.
+    waf_deny_response captcha_required status=403;
+    # Тело не сошлось с контрактом -- 400: это ошибка клиента, и он может
+    # исправить её сам. 403 сказал бы «запрещено», хотя запрещён не запрос, а
+    # его форма.
+    waf_deny_response json_invalid status=400;
+    # Ответ приложения не сошёлся со своей же спекой -- 502: виноват апстрим, и
+    # клиент тут ни при чём. Отдавать 400 за чужую ошибку значит врать клиенту.
+    waf_deny_response json_response_invalid status=502;
+    # Отказ счётчика -- «слишком много получено», и это 429: клиент может
+    # исправить это сам, выждав, и разница должна до него доходить.
+    waf_deny_response counter_limit status=429;
+
+    # Тело отказа по Accept: фронтенд с application/json получает
+    # <имя>.json из того же каталога страниц, браузер -- .html. Форма URI, а
+    # не именованный location: так nginx меняет метод на GET и POST не
+    # упирается в 405 статики.
+    map $http_accept $waf_deny_ext {
+        default              .html;
+        "~*application/json" .json;
+    }
+
+    # Куда сервису разрешено уводить клиента. Адрес приезжает с провода, и без
+    # этого списка инспектор мог бы отправить клиента куда угодно; ответ с
+    # непрошедшей целью отбрасывается целиком, то есть неотличим от молчания
+    # инспектора.
+    #
+    # Здесь две формы сразу: локальная страница челленджа и внешний сервис на
+    # любом поддомене chal.example.com, но только под /c/. Сам chal.example.com
+    # шаблоном *. не покрывается -- апекс обычно отдаёт что-то другое.
+    # /waf/login и /waf/code -- цели калитки. Без них редиректа не будет
+    # вовсе: ответ с непрошедшей целью отбрасывается целиком.
+    waf_redirect_allow /waf/captcha /waf/login /waf/login-totp /waf/code
+                       /waf/login-ldap /waf/login-list
+                       https://*.chal.example.com/c/;
+
+    waf_deadline request 2000ms block;
+    waf_on_absent request block;
+    # Умолчание модуля -- pass: мёртвая шина молча пропускала бы. В проде
+    # нет вердикта -- нет пропуска.
+    waf_on_bus_error request block;
+
+    # Порог по умолчанию. Маршруты CRS ставят 50: калибровка инспектора
+    # устроена так, что 5 баллов аномального счёта -- это score 50.
+    waf_score_deny request 100 response=suspicious;
+
+    # secure=off: локальное окружение без TLS, иначе cookie челленджа не
+    # вернётся и цикл проверки не замкнётся.
+    waf_cookie_defaults secure=off http_only=on same_site=Lax;
+
+    waf_debug_header on;
+
+    # --- локальный слой ----------------------------------------------------
+    #
+    # Зона общая на воркеры: в ней живут состояние circuit breaker, счётчики
+    # частоты и наборы данных. Объявлять её обязательно -- директивы ниже без
+    # неё не загрузятся, а не отключатся молча.
+    waf_shm_zone waf 8m;
+
+    # Наборы данных. Поставщик публикует их в JetStream, а воркер забирает
+    # последнее сообщение по каждому subject при старте -- поэтому набор не
+    # теряется при reload и не ждёт следующей публикации. Потока с такими
+    # subject в окружении по умолчанию нет: без него наборы просто пусты, и
+    # проверки по ним ничего не находят (docs/deploy/README.md#наборы-данных).
+    waf_local_dataset blocklist type=cidr limit=1000000 ttl=5m active;
+    waf_local_dataset allowlist type=cidr limit=1024 active;
+    waf_local_dataset badua     type=string limit=65536 active;
+
+    # Три списка для tests/lists: контроллер создаёт одноимённые active-наборы
+    # и пишет сюда add/remove. Имена в сообщении обязаны совпасть с этими.
+    # После правки -- reload всех трёх nginx, не restart: слоты свободны.
+    waf_local_dataset e2e_cidr type=cidr limit=100000 active;
+    waf_local_dataset e2e_ua   type=string limit=100000 active;
+    waf_local_dataset e2e_key  type=string limit=100000 active;
+
+    # Два набора калитки второго фактора.
+    #
+    # auth_sessions -- живые сессии: форма кладёт туда куку при входе. Маршрут
+    # объявляет `if $cookie_waf_sid not in auth_sessions`, и вошедший клиент
+    # проходит вообще без инспекции: ни сообщения на шину, ни GET в Redis за
+    # заголовками. Список -- кеш, а не источник истины: промах означает
+    # обычный путь через инспектора.
+    #
+    # auth_banned -- отмена снаружи. Положить туда куку может кто угодно:
+    # контроллер из UX, соседний сервис, скрипт разбора инцидента. Проверка
+    # стоит выше всего остального и отвечает 401 без единого сообщения на
+    # шину, поэтому бан действует на всех краях сразу, не дожидаясь ни
+    # инспектора, ни его множества отзыва.
+    #
+    # limit у сессий -- потолок одновременно вошедших. Переполнение набора не
+    # ломает вход: контроллер отвергнет add, запись не появится, и запросы
+    # этого клиента просто пойдут через инспектора.
+    waf_local_dataset auth_sessions type=string limit=20000 ttl=8h  active;
+    waf_local_dataset auth_banned   type=string limit=4096  ttl=24h active;
+
+    # Капча: прошедшие (waf_cid, быстрый путь) и бан снаружи. Запись кладёт
+    # captcha-http через .event, отменить может кто угодно из UX.
+    waf_local_dataset cap_cleared   type=string limit=50000 ttl=24h active;
+    waf_local_dataset cap_banned    type=string limit=8192  ttl=1h  active;
+    # Адреса, забаненные правилами капчи (on: bucket_ban -> write: addr).
+    # Отдельный набор, а не blocklist: тем владеет прогон наборов, который
+    # публикует снапшоты в шину сам, минуя контроллер.
+    waf_local_dataset cap_ipban     type=cidr   limit=8192  ttl=1h  active;
+
+    # --- тело запроса ------------------------------------------------------
+    #
+    # Что снимается ради инспекции. Тело в capture -- put до первой волны.
+    # Тело только в archive -- в Redis для агента после вердикта, волну 0
+    # не держит.
+    #
+    # Верхней границей всему это не является: waf_archive и waf_preview request снимают
+    # объект независимо от того, назван ли он здесь. Маршрут, которому тело
+    # отдавать нельзя, обязан не называть его нигде из трёх мест, а не только
+    # гасить его тут.
+    #
+    # Умолчание -- headers args, тело добавлено явно.
+    waf_capture request headers args body;
+
+    # --- превью в записи аудита --------------------------------------------
+    #
+    # Ось, не пересекающаяся со складом. Склад отвечает на "достать содержимое
+    # этого запроса", превью -- на "найти все запросы с таким заголовком": срез
+    # едет в саму запись и живёт в ClickHouse наравне с вердиктом, поэтому его
+    # объём задан здесь, а не размером запроса.
+    #
+    # Умолчание у всех трёх объектов -- off, поэтому молчание здесь обеднило бы
+    # каждую запись стенда: названный бюджет и есть требование извлечь объект.
+    # Размер можно и опустить -- тогда бюджетом станет всё, что WAF вообще
+    # читает (large_client_header_buffers, client_max_body_size, waf_body_limit),
+    # а на стенде это мегабайты в каждой датаграмме.
+    #
+    # Второе число -- потолок на пару: без него один разросшийся заголовок
+    # съедает бюджет секции и вытесняет остальные. У тела пары нет, и второго
+    # числа тоже.
+    #
+    # deny= здесь нет намеренно: authorization, proxy-authorization, cookie и
+    # set-cookie запрещены модулем всегда, и опция понадобилась бы только чтобы
+    # добавить к ним своё имя.
+    waf_preview request headers=30k/2k args=8k/1k body=10k;
+
+    # client_body_buffer_size намеренно оставлен по умолчанию (16k на 64-битной
+    # платформе). Тело крупнее буфера nginx кладёт в файл, и модуль читает его
+    # оттуда -- это другой путь сбора, чем цепочка буферов в памяти. Поднять
+    # буфер до размера самого крупного ожидаемого тела значило бы никогда его не
+    # проверять, а строчка "a client request body is buffered to a temporary
+    # file" в логе на /body/* -- ожидаемая, а не сигнал о неполадке. Порог не
+    # ровный: в памяти остаётся всё, что влезло в буфер с запасом в четверть --
+    # при 16k в файл уезжает тело крупнее ~20k.
+    #
+    # Диска в этом файле нет: client_body_temp_path на стенде смонтирован
+    # tmpfs (deploy/docker-compose.yml), и чтение оттуда -- копирование из
+    # страничного кеша. Путь сбора остаётся тем же и проверяется тем же
+    # прогоном.
+
+    # Горячий склад, один на весь контур: маршрут его не выбирает, потому что
+    # выбирать не из чего -- Redis того же контура, инспектор живёт в другом
+    # контейнере и читает объект сам, поэтому в сообщении едет только локатор
+    # <node>:<rid>:req.
+    #
+    # ttl -- страховка от падения воркера между размещением и удалением, а не
+    # замена удалению: штатно ключ снимается сразу после вердикта, и минута на
+    # ключе при заметном rps раздула бы Redis.
+    #
+    # retain_ttl -- для объектов, которые заберёт агент: пока он их не забрал,
+    # ключ обязан быть жив. Штатно его убивает агент, срок здесь только на
+    # случай, если агент до объекта не дошёл. Различим в прогоне: 15s против
+    # 5m на ключе.
+    #
+    # op_timeout меньше waf_deadline нарочно: размещение тела -- часть бюджета
+    # запроса, и хранилище, отвечающее дольше, обязано превратиться в
+    # unavailable, а не съесть весь дедлайн у инспекторов.
+    waf_store driver=redis url=redis://redis:6379 ttl=15s max=8m
+              retain_ttl=5m
+              pool=2 connect_timeout=200ms op_timeout=200ms;
+
+    # Тело в архив -- только на отказе и не больше 1m. waf_body_limit режет
+    # и инспекцию, и архив: больше этого модуль не читает, а второе слово
+    # решает судьбу запроса с телом крупнее -- по умолчанию block. Маршрут может
+    # заменить набор объектов, но не лимит, если свой waf_body_limit не задал.
+    waf_body_limit request 1m;
+    waf_archive request headers args body ttl=1h when=deny;
+
+    upstream backend {
+        server backend:8080;
+    }
+
+    server {
+        listen  8080;
+        root    /var/www;
+
+        waf on;
+        waf_inspect request ip wave=0 timeout=20ms;
+
+        # 0.0.0.0/0 -- только стенд: t/e2e.sh и t/ip.sh задают адрес
+        # заголовком, а не hop HAProxy. В бою сюда свои hop'ы.
+        set_real_ip_from 0.0.0.0/0;
+        set_real_ip_from ::/0;
+        real_ip_header X-Forwarded-For;
+
+        # --- страницы отказа ---------------------------------------------------
+        #
+        # Модуль возвращает статус-код (403, 429, 400), error_page перенаправляет
+        # на страницу, SSI подставляет переменные ($waf_ray, $waf_deny_name и
+        # т.д.) в шаблон. try_files выбирает файл по имени записи каталога
+        # waf_deny_response: blocked.html, suspicious.html, too_many.html --
+        # какой есть в /usr/share/waf/pages/.
+        #
+        # Форма с URI, а не с именованным location, и это не косметика: метод
+        # на GET nginx меняет только в ней (ngx_http_send_error_page). Через
+        # @waf_deny POST доезжал до статики как есть и получал от неё 405 --
+        # то есть отказ на POST выглядел для клиента иначе, чем тот же отказ
+        # на GET, и вместо страницы приходило "метод не разрешён".
+        error_page 400 =400 /pages/$waf_deny_name.html;
+        error_page 401 =401 /pages/$waf_deny_name.html;
+        error_page 403 =403 /pages/$waf_deny_name.html;
+        error_page 429 =429 /pages/$waf_deny_name.html;
+
+        # Путь совпадает с каталогом на диске нарочно: root, а не alias, --
+        # try_files внутри alias разбирает путь иначе, а страница отказа не то
+        # место, где стоит держать такую тонкость. Сам каталог раскатывает
+        # контроллер (docs/deny-pages.md); пока его нет, запрос доходит до
+        # последнего try_files, и статус при этом остаётся тем, что зафиксировал
+        # error_page.
+        location /pages/ {
+            internal;
+            waf off;
+            ssi on;
+            ssi_types *;
+            root /usr/share/waf;
+            try_files $uri /pages/blocked.html /index.html;
+        }
+
+        # Архив на маршрутах, куда бьёт k6 с кнопки UX (deploy/loadgen): без
+        # него карточка запроса в контроллере показывает вердикт без
+        # содержимого -- запись в ClickHouse есть, а смотреть в ней нечего.
+        # Срок 1h: у бакета есть правило на этот тег (deploy/minio),
+        # и часа хватает, чтобы разобрать прогон, не копя объекты сутками.
+        #
+        # Тело -- только на deny. Инспектор здесь ip и тела не читает, а архив
+        # читал бы его принудительно; burst.js шлёт на /app/ тела до мегабайта
+        # тысячами в секунду, и when=deny не кладёт их на allow.
+        location / {
+            waf_archive request headers args body ttl=1h when=deny;
+            try_files $uri $uri/ /index.html;
+        }
+
+        # Настоящий апстрим, а не статика -- см. комментарий в начале файла.
+        # Слеш после backend в proxy_pass режет префикс "/app": location
+        # "/app/echo" уходит на апстрим как "/echo", то есть ровно по таблице
+        # маршрутов из docs/backend/README.md.
+        location /app/ {
+            waf_archive request headers args body ttl=1h when=deny;
+            proxy_pass http://backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # /app/hang живёт дольше keepalive_timeout нарочно -- таймаут
+            # апстрима должен быть тем, что действительно проверяется, а не
+            # побочным эффектом общего для сервера значения.
+            proxy_read_timeout 90s;
+        }
+
+        # --- тело запроса ---------------------------------------------------
+        #
+        # Все шесть маршрутов ведут на /echo апстрима, а не на статику: статика
+        # отвечает 405 на POST, а тело здесь -- это то, что проверяется. Решает
+        # modsec: CRS 942100 ловит SQLi в теле из Redis. /body/inline/ и
+        # /body/store/ оба кладут тело в склад: порога инлайна больше нет, и
+        # форму размещения выбирает драйвер склада. Порог 50 -- как на /modsec/.
+
+        # Имя маршрута историческое: инлайн здесь ничего не решает.
+        location /body/inline/ {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h when=deny;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Тот же склад, тот же инспектор. Раньше порог инлайна отличал этот
+        # маршрут от /body/inline/; теперь оба дают 403 на то же тело.
+        location /body/store/ {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h when=deny;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Предел тела ниже присланного. Тело есть, но в контур не попадает, и
+        # это не молчаливая потеря проверки: инспектор видит
+        # unavailable: oversize, а исход решает второе слово waf_body_limit. По
+        # умолчанию block, и отказ здесь -- 503, как и всякое "вердикта нет":
+        # каталог waf_deny_response тут не при чём, отказал контур, а не правило.
+        location /body/oversize/ {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h when=deny;
+            waf_body_limit request 1k;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Тот же предел с обратной политикой: запрос идёт дальше, инспектор
+        # получает локатор с причиной и отвечает по остальным признакам. Так
+        # выкатывают предел на живой трафик, прежде чем включать блокировку.
+        location /body/oversize-pass/ {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h when=deny;
+            waf_body_limit request 1k pass;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Третий исход: разместить префикс. Контрольная сумма при этом считается
+        # по телу целиком -- она связывает событие с архивом, а в архиве
+        # оригинал; сверять её с префиксом инспектор не станет, иначе всякое
+        # усечённое тело было бы для него недоступным.
+        #
+        # Тело здесь JSON, и это существенно: префикс структурированного тела
+        # обрывается посреди значения и документом быть перестаёт. Инспектор
+        # правил сообщает об ошибке разбора (200002), ARGS остаются пустыми, и
+        # содержимое не проверяется -- то же тело, что блокируется на
+        # /body/inline/ и /body/store/, здесь проходит. Прогон --
+        # tests/audit/truncate.sh.
+        location /body/truncate/ {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h when=deny;
+            waf_body_limit request 1k trim;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Отсечение до волн. Локальный лимит решает на месте, до единого
+        # сообщения на шину, и тело при этом не читается вовсе -- ни в память,
+        # ни в хранилище. Это не оптимизация, а свойство порядка: тело читает
+        # волна, которой оно нужно, а до волн запрос здесь не доходит.
+        #
+        # burst=1: запас ровно в один запрос, поэтому второй запрос той же
+        # секунды отвергается, а секунду спустя маршрут снова отвечает. Запас
+        # нужен именно единичный -- с burst=0 ведро отвергает всё, кроме первого
+        # обращения по ключу (docs/nginx/module/known-issues.md).
+        location /body/rate/ {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h when=deny;
+            waf_local_rate $binary_remote_addr rate=1r/s burst=1
+                           response=too_many;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Архивация. Модуль оставляет заголовки и тело жить: владение ключами
+        # переходит агенту, он перекладывает их в MinIO, подменяет локаторы в
+        # записи аудита и чистит Redis сам.
+        #
+        # Две ветви сразу, и обе нужны. Тело: бакет у агента есть, объект
+        # уезжает, ключ снимается. Заголовки: бакета для них на стенде нет
+        # (docker-compose.yml), агент помечает локатор archive_error и ключ не
+        # трогает -- его доберёт retain_ttl. Прогон -- tests/body и tests/audit.
+        location /body/archive/ {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers body ttl=7d;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Превью в записи, без склада и без архива. Инспектор здесь -- ip: он
+        # тела не просит, поэтому маршрут показывает обе стороны сразу. Названное
+        # превью тела и есть требование его прочитать: не назови его тут -- и
+        # секция была бы пуста, потому что тело никому больше не нужно.
+        #
+        # Бюджеты сознательно крошечные, и две оси разведены по объектам. У
+        # заголовков есть потолок на пару (96): длинное значение приезжает
+        # помеченным огрызком, а пара с именем длиннее половины потолка
+        # выбрасывается целиком и считается в headers_preview_dropped. У
+        # параметров потолка нет, и там видно второе правило -- пара, не
+        # влезающая в остаток бюджета секции, не пишется вовсе.
+        #
+        # x-preview-secret добавлен к встроенным именам, а не вместо них:
+        # authorization и cookie остаются запрещёнными и здесь.
+        #
+        # Прогон -- tests/audit/preview.sh.
+        location /preview/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_archive request headers args body ttl=1h when=deny;
+            waf_preview request headers=512/96 args=128 body=64;
+            waf_preview request headers deny=x-preview-secret;
+            # Предел склада ниже превью и ниже присылаемого тела. Тело здесь
+            # никуда не размещается -- его никто не просил, -- поэтому ни
+            # локатора, ни политики waf_body_limit на маршруте не возникает:
+            # превью читает тело для записи, а не для контура.
+            waf_body_limit request 1k;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # --- docs/directives/http.md: матрица директив (tests/http) --------
+        #
+        # Отдельные маршруты, чтобы не ломать /body/* и /preview/. На каждом
+        # явно стоят capture / archive / preview: иначе наследуются http-уровень
+        # (тело инспекторам, архив when=deny, превью 30k) и прогон смотрит
+        # не на ту ось.
+
+        # client_max_body_size: 413 до модуля, не 503 от waf_body_limit.
+        location /http/client-max/ {
+            client_max_body_size 1k;
+            waf_body_limit request 1k;
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request none;
+            waf_preview request none;
+            waf_archive request none;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/limit-block/ {
+            client_max_body_size 8k;
+            waf_body_limit request 512 block;
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_capture request headers args body;
+            waf_preview request none;
+            waf_archive request none;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/limit-trim/ {
+            client_max_body_size 8k;
+            waf_body_limit request 512 trim;
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_capture request headers args body;
+            waf_preview request none;
+            waf_archive request none;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/limit-pass/ {
+            client_max_body_size 8k;
+            waf_body_limit request 512 pass;
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_capture request headers args body;
+            waf_preview request none;
+            waf_archive request none;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Склад: ключ живёт retain_ttl, пока агент забирает архив.
+        location /http/store-keys/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request headers args body;
+            waf_archive request headers body ttl=1h when=allow,deny;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/archive-sized/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request none;
+            waf_preview request none;
+            waf_archive request reload headers=256 args=128 body=256 ttl=1h when=allow,deny;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/archive-whole/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request none;
+            waf_preview request none;
+            waf_archive request reload headers args body ttl=1h when=allow,deny;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/archive-no-hdr/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request none;
+            waf_preview request none;
+            waf_archive request none;
+            waf_archive request reload args body ttl=1h when=allow,deny;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/archive-when-deny/ {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_capture request headers args body;
+            waf_archive request body ttl=1h when=deny;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/archive-when-allow/ {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_capture request headers args body;
+            waf_archive request body ttl=1h when=allow;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/preview-size/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request headers=256 args=128 body=64;
+            waf_archive request none;
+            waf_preview request headers=256/64 args=128 body=64;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/preview-allow-hdr/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request headers;
+            waf_archive request none;
+            waf_archive request headers ttl=1h when=allow,deny;
+            waf_preview request headers=4k args=none body=none;
+            waf_preview request headers allow=x-keep,content-type;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/preview-deny-hdr/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request headers;
+            waf_archive request none;
+            waf_archive request headers ttl=1h when=allow,deny;
+            waf_preview request headers=4k args=none body=none;
+            waf_preview request headers deny=x-secret,x-token;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/preview-allow-args/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request args;
+            waf_archive request none;
+            waf_archive request args ttl=1h when=allow,deny;
+            waf_preview request headers=none args=2k body=none;
+            waf_preview request args allow=id,page;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/preview-deny-args/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request args;
+            waf_archive request none;
+            waf_archive request args ttl=1h when=allow,deny;
+            waf_preview request headers=none args=2k body=none;
+            waf_preview request args deny=token,secret;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/preview-allow-deny/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request headers;
+            waf_archive request none;
+            waf_archive request headers ttl=1h when=allow,deny;
+            waf_preview request headers=4k args=none body=none;
+            waf_preview request headers allow=x-keep,x-secret;
+            waf_preview request headers deny=x-secret;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/capture-limit/ {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            # Архив и превью выкл: иначе put = max(трёх), и лимит capture
+            # не тот, что видит инспектор.
+            waf_capture request headers=128 args=64 body=256;
+            waf_preview request none;
+            waf_archive request none;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/capture-whole/ {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_capture request headers args body;
+            waf_archive request headers args body ttl=1h when=allow,deny;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/capture-off/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request none;
+            waf_archive request none;
+            waf_archive request reload body ttl=1h when=allow,deny;
+            waf_preview request args=none;
+            waf_preview request reload headers=2k body=64;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/capture-mask-hdr/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request headers;
+            waf_capture request headers mask=x-token,x-key;
+            waf_archive request none;
+            waf_archive request headers ttl=1h when=allow,deny;
+            waf_archive request headers mask=x-token,x-key;
+            waf_preview request args=none body=none;
+            waf_preview request reload headers=4k;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/capture-mask-args/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request args;
+            waf_capture request args mask=token,key;
+            waf_archive request none;
+            waf_archive request args ttl=1h when=allow,deny;
+            waf_archive request args mask=token,key;
+            waf_preview request headers=none body=none;
+            waf_preview request reload args=2k;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/capture-deny-hdr/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request headers;
+            waf_capture request headers deny=x-internal,x-hidden;
+            waf_archive request none;
+            waf_archive request headers ttl=1h when=allow,deny;
+            waf_archive request headers deny=x-internal,x-hidden;
+            waf_preview request args=none body=none;
+            waf_preview request reload headers=4k;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/capture-deny-args/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request args;
+            waf_capture request args deny=session,sid;
+            waf_archive request none;
+            waf_archive request args ttl=1h when=allow,deny;
+            waf_archive request args deny=session,sid;
+            waf_preview request headers=none body=none;
+            waf_preview request reload args=2k;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Redis = max(preview, archive, capture). Агент режет archive при PUT.
+        location /http/max-three/ {
+            client_max_body_size 8k;
+            waf_body_limit request 4k;
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_capture request headers args body=256;
+            waf_archive request body=64 ttl=1h when=allow,deny;
+            waf_preview request headers=none args=none body=128;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /http/max-three-meta/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request headers=64;
+            waf_archive request none;
+            waf_archive request reload headers=256 ttl=1h when=allow,deny;
+            waf_preview request reload headers=128;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Маршруты инспектора правил. Набор здесь только modsec: код ответа
+        # и счёт определяются CRS, ip в сумму не входит.
+        #
+        #     curl -i "localhost:8080/modsec/?id=1'+or+1=1--"
+        #
+        # За модулем стоит апстрим, а не статика, и по одной причине: статика
+        # отвечает 405 на POST, а тело запроса -- половина того, на что смотрит
+        # CRS. Все четыре маршрута ведут на /echo, который отражает то, что
+        # реально доехало.
+        #
+        # Порог 50, а не унаследованная сотня: калибровка инспектора устроена
+        # так, что 5 баллов аномального счёта CRS -- это score 50 (см.
+        # internal/verdict). То есть здесь модуль блокирует ровно там же, где
+        # заблокировал бы сам CRS со штатным порогом 5, и разница между "решает
+        # набор правил" и "решает контур" видна не на словах: порог правится
+        # здесь, а профиль -- у инспектора.
+        #
+        # Архив здесь и на соседних /modsec-*/ -- ради карточки в контроллере:
+        # сюда бьёт modsec.js с кнопки UX, и без архива прогон виден только
+        # счётом. Тело в наборе есть, в отличие от / и /app/: CRS его и так
+        # читает, принудительным чтением архив тут ничего не добавляет.
+        location /modsec/ {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Тот же процесс, другой профиль в реестре. Значение непрозрачно для
+        # модуля и уезжает в route.profile как есть.
+        location /modsec-strict/ {
+            waf_inspect request modsec-strict wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Профиля с таким именем у инспектора нет. Политика deny: отсутствие
+        # набора -- отказ, а не откат на default. Чистый запрос здесь тоже
+        # 403 -- иначе разъезд nginx и профилей обнаруживался бы на трафике.
+        location /modsec-unknown/ {
+            waf_inspect request modsec-unknown wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Так его и выкатывают на живой маршрут: вердикт в лог и в аудит, счёт --
+        # в теневую сумму, трафик не трогается.
+        location /modsec-passive/ {
+            waf_inspect request modsec wave=0 timeout=1000ms mode=passive;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Профили-фикстуры: ответ не зависит от запроса вовсе. Маршруты выше
+        # проверяют детект и потому меняются вместе с обновлением CRS, эти два --
+        # только то, что профиль с маршрута доехал до инспектора и что вердикт
+        # применён. Нужны они порознь: allow отличает "инспектор ответил
+        # разрешением" от "инспектора на маршруте нет", deny доводит до клиента
+        # вмешательство самого движка, а не порог модуля.
+        #
+        # waf_score_deny здесь не задан намеренно: ни один из двух через счёт не
+        # проходит -- у deny вердикт приходит готовым, у allow счёт нулевой, -- и
+        # порог на этих маршрутах ничего не решает.
+        location /modsec-deny/ {
+            waf_inspect request modsec-deny wave=0 timeout=1000ms;
+            waf_archive request headers args body ttl=1h;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /modsec-allow/ {
+            waf_inspect request modsec-allow wave=0 timeout=1000ms;
+            waf_archive request headers args body ttl=1h;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /modsec-api/ {
+            waf_inspect request modsec-api wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Профиль под управлением e2e-раннера (tests/runner/scenarios/modsec.mjs):
+        # он сам заводит rule-файлы и rule-set "e2e" через API и шлёт их
+        # send-ом, поэтому маршрут -- постоянная фикстура, а содержимое профиля
+        # живёт в Postgres контроллера, не здесь.
+        #
+        # Раннер навешивает на путь <runId>/<case> -- это ключ корреляции с
+        # аудитом (r->uri, см. audit.md), поэтому в отличие от соседних
+        # /modsec-*/ здесь proxy_pass -- с завершающим слешем: суффикс уходит
+        # апстриму как /echo/<runId>/<case>, а не слипается в /echo<runId>...
+        # backend/src/routes.ts матчит /echo и /echo/* одинаково.
+        #
+        # Логирование: заголовки, query и тело на deny. На /modsec-e2e-body/
+        # архив и на allow. ttl=1h -- срок объекта в S3, он же тег, по
+        # которому его удалит lifecycle-правило бакета; момент отсчёта знает
+        # хранилище, а не модуль. Бакеты waf-headers / waf-args / waf-bodies
+        # заданы у агента и поиска.
+        location /modsec-e2e/ {
+            waf_inspect request modsec-e2e wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h when=deny;
+            proxy_pass http://backend/echo/;
+            proxy_set_header Host $host;
+        }
+
+        location /modsec-e2e-body/ {
+            waf_inspect request modsec-e2e wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h;
+            proxy_pass http://backend/echo/;
+            proxy_set_header Host $host;
+        }
+
+        # Фаза ответа (tests/runner/scenarios/response.mjs). echo отражает
+        # тело запроса в теле ответа, и маркер в POST -- это маркер в ответе:
+        # правило phase:4 профиля e2e-rsp видит его только там. Съём ответа
+        # задаёт и потолок удержания; превью -- первые 2k тела в записи;
+        # архив -- на отказ. Запрос тоже под инспектором: две записи с общим
+        # ray, и when=deny у запроса смотрится по последней фазе (archive.md).
+        # Липкости здесь нет намеренно: без keep=/resume= инспектор фазы
+        # ответа инициализируется заново по request_store (путь переигровки);
+        # липкий путь -- соседний /modsec-e2e-rsp-always/.
+        location /modsec-e2e-rsp/ {
+            waf_inspect request modsec-e2e-rsp wave=0 timeout=1000ms;
+            waf_inspect response modsec-e2e-rsp wave=0 timeout=1000ms;
+            waf_capture response headers body=64k;
+            waf_preview response body=2k;
+            waf_archive request headers args body ttl=1h when=deny;
+            waf_archive response headers body ttl=1h when=deny;
+            proxy_pass http://backend/echo/;
+            proxy_set_header Host $host;
+        }
+
+        # То же, архив ответа при любом исходе -- и липкая пара: фаза запроса
+        # держит транзакцию (keep=on), фаза ответа доигрывает её на том же
+        # экземпляре (resume=prefer), без состояния переигрывает.
+        location /modsec-e2e-rsp-always/ {
+            waf_inspect request modsec-e2e-rsp wave=0 timeout=1000ms keep=on;
+            waf_inspect response modsec-e2e-rsp wave=0 timeout=1000ms resume=prefer;
+            waf_capture response headers body=64k;
+            waf_preview response body=2k;
+            waf_archive request headers args body ttl=1h;
+            waf_archive response headers body ttl=1h;
+            proxy_pass http://backend/echo/;
+            proxy_set_header Host $host;
+        }
+
+        # Инспектор адреса. Из сети compose $remote_addr -- частная сеть,
+        # и тестовый allowlist её пропускает. На этих маршрутах realip
+        # подменяет адрес из X-Forwarded-For: модуль кладёт его в
+        # conn.client_ip. Так t/ip.sh гоняет curl, не только probe.
+        # 0.0.0.0/0 -- только стенд; в бою сюда свои hop'ы.
+        # Архив тела здесь -- единственное место, где оно не бесплатно:
+        # инспекторам тела нет (перекрываем http-дефолт), в Redis оно
+        # появляется после вердикта, на reload перед агентом. Так и
+        # задумано -- combo.js бьёт сюда с телом, и карточка соло-набора
+        # должна показывать то же, что карточки комбинаций.
+        location /ip/ {
+            set_real_ip_from 0.0.0.0/0;
+            set_real_ip_from ::/0;
+            real_ip_header X-Forwarded-For;
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_capture request headers args;
+            waf_archive request headers args ttl=1h;
+            waf_preview request reload body=10k;
+            waf_archive request reload body ttl=1h;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /ip-admin/ {
+            set_real_ip_from 0.0.0.0/0;
+            set_real_ip_from ::/0;
+            real_ip_header X-Forwarded-For;
+            waf_inspect request ip-admin wave=0 timeout=20ms;
+            waf_capture request headers args;
+            waf_archive request headers args ttl=1h when=deny;
+            waf_preview request reload body=10k;
+            waf_archive request reload body ttl=1h when=deny;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /ip-ext/ {
+            set_real_ip_from 0.0.0.0/0;
+            set_real_ip_from ::/0;
+            real_ip_header X-Forwarded-For;
+            waf_inspect request ip-ext wave=0 timeout=20ms;
+            waf_capture request headers args;
+            waf_archive request headers args ttl=1h when=deny;
+            waf_preview request reload body=10k;
+            waf_archive request reload body ttl=1h when=deny;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /ip-unknown/ {
+            set_real_ip_from 0.0.0.0/0;
+            set_real_ip_from ::/0;
+            real_ip_header X-Forwarded-For;
+            waf_inspect request ip-unknown wave=0 timeout=20ms;
+            waf_capture request headers args;
+            waf_archive request headers args ttl=1h when=deny;
+            waf_preview request reload body=10k;
+            waf_archive request reload body ttl=1h when=deny;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Пути /vlai* оставлены, чтобы combo/k6 не ловили 404. Инспектора
+        # нет -- архив тоже снят: удерживать некого.
+        location /vlai/ {
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /vlai-deny/ {
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Комбинации ip → CRS. Имена /ip-vlai* исторические: модели на
+        # маршруте больше нет. Архив headers/args/body на любой исход --
+        # allow без архива выглядит в карточке как «содержимого нет»,
+        # хотя запись в ClickHouse есть.
+        # when= не ставим: умолчание -- все исходы. В S3 уезжают headers,
+        # args и body (бакеты waf-headers / waf-args / waf-bodies).
+        #
+        #     /ip-modsec/        волны [ip] [modsec]
+        #     /ip-vlai/          волна [ip]
+        #     /ip-modsec-vlai/   волны [ip] [modsec]
+        #
+        # Прогон -- t/combo/combo.sh и loadgen/combo.js.
+        # ttl=10m: карточка инцидента успевает открыть тело из S3.
+        location /ip-modsec/ {
+            set_real_ip_from 0.0.0.0/0;
+            set_real_ip_from ::/0;
+            real_ip_header X-Forwarded-For;
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_inspect request modsec wave=1 timeout=1000ms;
+            waf_archive request headers args body ttl=10m;
+            waf_score_deny request 50 response=suspicious;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /ip-vlai/ {
+            set_real_ip_from 0.0.0.0/0;
+            set_real_ip_from ::/0;
+            real_ip_header X-Forwarded-For;
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_archive request headers args body ttl=10m;
+            waf_score_deny request 50 response=suspicious;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /ip-modsec-vlai/ {
+            set_real_ip_from 0.0.0.0/0;
+            set_real_ip_from ::/0;
+            real_ip_header X-Forwarded-For;
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_inspect request modsec wave=1 timeout=1000ms;
+            waf_archive request headers args body ttl=10m;
+            waf_score_deny request 50 response=suspicious;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /modsec-vlai/ {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=suspicious;
+            waf_archive request headers args body ttl=1h;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        location /ip-heavy/ {
+            set_real_ip_from 0.0.0.0/0;
+            set_real_ip_from ::/0;
+            real_ip_header X-Forwarded-For;
+            waf_inspect request ip-heavy wave=0 timeout=20ms;
+            waf_archive request headers args body ttl=1h when=deny;
+            proxy_pass http://backend/echo;
+            proxy_set_header Host $host;
+        }
+
+        # Пассивный режим: инспектор опрашивается и попадает в лог, но
+        # вердикт не блокирует. Адрес из blocklist здесь даёт 200.
+        #     curl -H 'X-Forwarded-For: 203.0.113.10' localhost:8080/passive/
+        location /passive/ {
+            waf_inspect request ip wave=0 timeout=20ms mode=passive;
+            waf_archive request headers args body ttl=1h when=deny;
+            try_files /index.html =404;
+        }
+
+        # Смешанный маршрут: ip решает, modsec только наблюдает.
+        location /shadow/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_inspect request modsec wave=1 timeout=1000ms mode=passive;
+            waf_archive request headers args body ttl=1h when=deny;
+            try_files /index.html =404;
+        }
+
+        # Полное игнорирование: на шину не уходит ни одного сообщения.
+        location /ignored/ {
+            waf_inspect request none;
+            waf_archive request none;
+            try_files /index.html =404;
+        }
+
+        # Локальный слой: решение принимается на месте, до единого сообщения на
+        # шину. Порядок проверок -- порядок объявления, и разрешающая стоит
+        # выше запрещающих нарочно: набор allowlist -- это список того, что не
+        # проверяется вовсе.
+        #
+        #     curl -i localhost:8080/local/            -- пусто, проверок нет
+        #     for i in $(seq 12); do curl -s -o /dev/null -w '%{http_code}\n' \
+        #         localhost:8080/local/; done          -- последние 429
+        location /local/ {
+            waf_archive request headers args body ttl=1h when=deny;
+            waf_local_check allowlist $binary_remote_addr action=allow;
+            waf_local_check blocklist $binary_remote_addr action=block
+                            response=blocked;
+            waf_local_check badua     $http_user_agent    action=block
+                            response=suspicious;
+
+            # Низкий лимит нарочно: это маршрут, на котором превышение
+            # проверяется руками, а не нагрузкой.
+            waf_local_rate $binary_remote_addr rate=5r/s burst=5
+                           response=too_many;
+
+            try_files /index.html =404;
+        }
+
+        # Наблюдающий лимит: превышение попадает в лог и в метрики, запрос идёт
+        # дальше. Так лимит подбирают на реальном трафике, прежде чем включать
+        # блокировку.
+        #
+        # Числа здесь отличаются от /local/ нарочно: счётчик отделяется от чужих
+        # подписью правила, а в неё входят ключ, частота, всплеск и способ счёта,
+        # но не маршрут и не действие. Одинаково объявленный лимит на двух
+        # маршрутах -- это один счётчик на оба, и наблюдающий маршрут делил бы
+        # ведро с блокирующим.
+        location /local-pass/ {
+            waf_archive request headers args body ttl=1h when=deny;
+            waf_local_rate $binary_remote_addr rate=5r/s burst=2 action=pass;
+            try_files /index.html =404;
+        }
+
+        # Счёт по волнам, а не по запросам: усиление на шине даёт волна, и
+        # запрос с двумя волнами (ip → modsec) стоит контуру вдвое дороже
+        # одноволнового.
+        location /local-waves/ {
+            waf_inspect request ip wave=0 timeout=20ms;
+            waf_inspect request modsec wave=1 timeout=1000ms;
+            waf_archive request headers args body ttl=1h when=deny;
+            waf_local_rate $binary_remote_addr rate=10r/s burst=10
+                           count=waves response=too_many;
+            try_files /index.html =404;
+        }
+
+        # Списки контроллера. Инспекторы выключены: здесь проверяется только
+        # локальный слой, и чужой вердикт ip не должен маскировать 403 от
+        # набора. realip -- чтобы k6 и curl банили адрес из X-Forwarded-For,
+        # а не hop HAProxy. Лимита частоты нет: нагрузка идёт с loadgen.
+        #
+        #     curl -H 'X-Forwarded-For: 203.0.113.77' localhost:8081/lists/
+        #     curl -H 'User-Agent: e2e-lists/1.0'     localhost:8081/lists/
+        #     curl -H 'X-E2E-Key: lists-token-a'      localhost:8081/lists/
+        location /lists/ {
+            set_real_ip_from 0.0.0.0/0;
+            set_real_ip_from ::/0;
+            real_ip_header X-Forwarded-For;
+
+            waf_inspect request none;
+            waf_archive request none;
+
+            waf_local_check e2e_cidr $binary_remote_addr action=block
+                            response=blocked;
+            waf_local_check e2e_ua   $http_user_agent    action=block
+                            response=suspicious;
+            waf_local_check e2e_key  $http_x_e2e_key     action=block
+                            response=blocked;
+
+            try_files /index.html =404;
+        }
+
+        # --- второй фактор ---------------------------------------------------
+        #
+        # Калитка стоит поздней волной: к её вопросу счёт уже накоплен, и
+        # дорогой GET в Redis за заголовками не делается раньше дешёвой
+        # проверки адреса. weight=0 -- она не оценивает, а решает.
+        #
+        # Съём заголовков обязателен, и маскировать cookie на этих маршрутах
+        # нельзя: инспектор увидел бы sha256 вместо токена и уводил бы на
+        # форму уже вошедших. Здесь он унаследован от http-умолчания
+        # (headers args), но назван явно -- потому что от него зависит работа
+        # маршрута, а не только полнота аудита.
+        #
+        # Вход стенда: operator / waf-demo-2fa плюс код TOTP по секрету
+        # JBSWY3DPEHPK3PXP.
+        # Публичный путь под калиткой делается маршрутом, а не списком
+        # исключений в профиле: инспектор здесь просто не объявлен, и до шины
+        # запрос не доходит вовсе. Список путей в профиле стоил бы сообщения
+        # на каждой пробе и держал бы второе место, где решают, что публично.
+        location = /auth/healthz {
+            waf_inspect request ip wave=0 timeout=20ms;
+
+            proxy_pass http://backend/healthz;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location /auth/ {
+            waf_capture request headers args;
+
+            # Отмена снаружи: идентификатор сессии в auth_banned -- 401 до
+            # всякой волны, без единого сообщения на шину. Класть туда может
+            # кто угодно: контроллер из UX, соседний сервис, скрипт разбора.
+            waf_local_check auth_banned $cookie_waf_sess action=block
+                            response=auth_required;
+
+            waf_inspect request ip   wave=0 timeout=20ms;
+            # Здесь калитку спрашивают на каждом запросе: маршрут показывает
+            # заголовки личности, а их ставит только вердикт allow.
+            # Пароль плюс TOTP -- две калитки на двух волнах: вторая стоит
+            # после первой и заголовки личности ставит последней (pwd+totp).
+            waf_inspect request auth      wave=1 timeout=20ms weight=0;
+            waf_inspect request auth-totp wave=2 timeout=20ms weight=0;
+
+            proxy_pass http://backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Тот же процесс, другой профиль: общий код доступа вместо списка
+        # пользователей. Код стенда -- let-me-in-2fa.
+        location /auth-code/ {
+            waf_capture request headers args;
+            waf_inspect request auth-code wave=1 timeout=20ms weight=0;
+
+            proxy_pass http://backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Тот же профиль, но с быстрым путём по активному списку: вошедший
+        # клиент калитку не будит вовсе. Условие читает короткую куку
+        # waf_sess -- идентификатор сессии, который форма кладёт в набор при
+        # входе и убирает при выходе.
+        #
+        # Цена быстрого пути -- заголовки личности. Их ставит вердикт allow, а
+        # его здесь нет, поэтому приложение на этом маршруте не узнает, кто
+        # вошёл, и обязано читать куку само. Чтобы клиент не подсунул чужое
+        # имя, заголовки снимаются явно.
+        location /auth-fast/ {
+            waf_capture request headers args;
+
+            waf_local_check auth_banned $cookie_waf_sess action=block
+                            response=auth_required;
+
+            # Список ведёт последняя калитка (default-totp): запись означает
+            # полный вход, и по ней снимаются обе.
+            waf_inspect request auth      wave=1 timeout=20ms weight=0
+                        if $cookie_waf_sess not in auth_sessions;
+            waf_inspect request auth-totp wave=2 timeout=20ms weight=0
+                        if $cookie_waf_sess not in auth_sessions;
+
+            proxy_pass http://backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-WAF-User "";
+            proxy_set_header X-WAF-Groups "";
+            proxy_set_header X-WAF-Auth "";
+        }
+
+        # Тот же процесс и тот же профильный механизм, но способ входа --
+        # список логинов и паролей контура, без второго фактора. Разница с
+        # /auth/ ровно в одной строке профиля: factors: [local] вместо
+        # factors: [local, code].
+        location /auth-list/ {
+            waf_capture request headers args;
+            waf_inspect request auth-list wave=1 timeout=20ms weight=0;
+
+            proxy_pass http://backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Пароль проверяет каталог (контейнер ldap), а не контур: форма
+        # отдаёт его операцией bind и знает только, сошлось или нет.
+        # Вход стенда: ivanov / ldap-demo-2fa. Учётная запись sidorov -- тот
+        # же пароль, но вне группы допуска.
+        location /auth-ldap/ {
+            waf_capture request headers args;
+            waf_inspect request auth-ldap wave=1 timeout=20ms weight=0;
+
+            proxy_pass http://backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Наблюдение: allow всегда, решение видно в аудите. Так калитку
+        # выкатывают на живой маршрут, не заперев за ней пользователей.
+        location /auth-observe/ {
+            waf_capture request headers args;
+            waf_inspect request auth-observe wave=1 timeout=20ms weight=0;
+
+            proxy_pass http://backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Цели редиректа калитки. waf off обязателен: иначе вход требует
+        # входа. Префиксная форма, а не "=", -- под ней живут ещё /renew и
+        # /logout того же процесса.
+        location ^~ /waf/login {
+            waf off;
+
+            # Через переменную и resolver, а не блоком upstream: контейнер
+            # формы пересоздают чаще, чем перечитывают конфиг, а upstream
+            # резолвит имя один раз при загрузке и после этого держит старый
+            # адрес до reload.
+            set $app_auth auth-http:8080;
+            proxy_pass http://$app_auth$request_uri;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # /waf/login-ldap длиннее /waf/login, поэтому побеждает он: nginx
+        # выбирает самый длинный совпавший префикс, а не первый.
+        location ^~ /waf/login-ldap {
+            waf off;
+
+            set $app_auth_ldap auth-http:8080;
+            proxy_pass http://$app_auth_ldap$request_uri;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location ^~ /waf/login-list {
+            waf off;
+
+            set $app_auth_list auth-http:8080;
+            proxy_pass http://$app_auth_list$request_uri;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Вторая калитка маршрута /auth/: форма кода того же процесса.
+        location ^~ /waf/login-totp {
+            waf off;
+
+            set $app_auth_totp auth-http:8080;
+            proxy_pass http://$app_auth_totp$request_uri;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location ^~ /waf/code {
+            waf off;
+
+            # Через переменную и resolver, а не блоком upstream: контейнер
+            # формы пересоздают чаще, чем перечитывают конфиг, а upstream
+            # резолвит имя один раз при загрузке и после этого держит старый
+            # адрес до reload.
+            set $app_auth auth-http:8080;
+            proxy_pass http://$app_auth$request_uri;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Капча: виджет каждому без клиренса (профиль login, when: always).
+        # Заголовки снимаются ради cookie, args -- ради возврата с query.
+        location /captcha/ {
+            # С хоста край виден через HAProxy :8081, а nginx слушает 8080:
+            # абсолютный Location увёл бы браузер на чужой порт.
+            absolute_redirect off;
+            error_page 403 =403 /pages/$waf_deny_name$waf_deny_ext;
+            error_page 429 =429 /pages/$waf_deny_name$waf_deny_ext;
+
+            waf_capture request headers args;
+            waf_inspect request ip            wave=0 timeout=20ms;
+            waf_inspect request captcha-login wave=1 timeout=20ms weight=0;
+
+            proxy_pass http://backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Капча по счёту: modsec скорит (SQLi -> 50 с кодом CRS_ANOMALY, XSS ->
+        # 100), порог отказа поднят, чтобы решала капча: 100 -> по порогу
+        # профиля, 50 -> по prior-правилу на код modsec, чистый -> allow.
+        location /captcha-score/ {
+            absolute_redirect off;
+            error_page 403 =403 /pages/$waf_deny_name$waf_deny_ext;
+            error_page 429 =429 /pages/$waf_deny_name$waf_deny_ext;
+
+            waf_capture request headers args;
+            waf_score_deny request 200 response=suspicious;
+            waf_inspect request modsec  wave=0 timeout=1000ms;
+            waf_inspect request captcha wave=1 timeout=20ms weight=0;
+
+            proxy_pass http://backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Быстрый путь: прошедшего капчу (waf_cid в cap_cleared) инспектор не
+        # спрашивают; лимит считается по клиренсу, а не по адресу, и
+        # превысивший уезжает в cap_banned, где его режет первая строка.
+        location /captcha-fast/ {
+            absolute_redirect off;
+            error_page 403 =403 /pages/$waf_deny_name$waf_deny_ext;
+            error_page 429 =429 /pages/$waf_deny_name$waf_deny_ext;
+
+            waf_capture request headers args;
+
+            # Адрес, забаненный правилом капчи на другом маршруте, закрыт и
+            # здесь: набор -- свойство края, а не маршрута.
+            waf_local_check cap_ipban  $binary_remote_addr action=block
+                            response=blocked;
+            waf_local_check cap_banned $waf_request_cookies.waf_cid action=block
+                            response=too_many;
+            waf_local_rate  $waf_request_cookies.waf_cid rate=5r/s burst=5
+                            response=too_many list=cap_banned
+                            if $waf_request_cookies.waf_cid in cap_cleared;
+
+            waf_inspect request captcha-login wave=1 timeout=20ms weight=0
+                        if $waf_request_cookies.waf_cid not in cap_cleared;
+
+            proxy_pass http://backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Групповая работа: три края, две реплики инспектора, один счёт.
+        # Профиль cluster требует виджет каждому (when: always) и правилами
+        # доводит провалы до бана: fail -> +25% корзины ip, ban_at -> запись
+        # адреса в cap_ipban. Первая строка -- локальный слой: забаненный
+        # режется здесь, до шины и до инспекторов, на каждом крае.
+        location /captcha-cluster/ {
+            absolute_redirect off;
+            error_page 403 =403 /pages/$waf_deny_name$waf_deny_ext;
+            error_page 429 =429 /pages/$waf_deny_name$waf_deny_ext;
+
+            waf_capture request headers args;
+            waf_local_check cap_ipban $binary_remote_addr action=block
+                            response=blocked;
+            waf_inspect request captcha-cluster wave=1 timeout=20ms weight=0;
+
+            proxy_pass http://backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Капча в наблюдении: allow всегда, would/trigger в аудите.
+        location /captcha-observe/ {
+            waf_capture request headers args;
+            waf_inspect request captcha-observe wave=1 timeout=20ms weight=0;
+
+            proxy_pass http://backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # --- контракт API (inspectors/json) --------------------------------
+        #
+        # Профиль называет base_path -- префикс, который срезается с URI перед
+        # сопоставлением со спекой, -- поэтому у каждого профиля свой location:
+        # префикс в профиле обязан совпасть с префиксом маршрута.
+        #
+        # Тело едет инспектору целиком: waf_body_limit request 1m block. С trim
+        # документ обрывается, и «валидно» от «невалидно» уже не отличить --
+        # именно поэтому у профиля есть отдельная политика on_truncated, и
+        # именно поэтому маршрут настроен так, чтобы она не срабатывала.
+        location /json/ {
+            waf_capture request  headers args body;
+            waf_capture response headers body=64k;
+            waf_body_limit request  1m block;
+            waf_body_limit response 1m trim;
+
+            waf_inspect request  json wave=0 timeout=1000ms;
+            waf_inspect response json wave=0 timeout=1000ms;
+            waf_archive request headers args body ttl=1h when=deny;
+
+            proxy_pass http://backend/echo/;
+            proxy_set_header Host $host;
+        }
+
+        # Тот же процесс, профиль strict: путь вне спеки -- отказ, ответ не по
+        # спеке -- тоже. Так контракт превращается в белый список.
+        location /json-strict/ {
+            waf_capture request  headers args body;
+            waf_capture response headers body=64k;
+            waf_body_limit request  1m block;
+            waf_body_limit response 1m trim;
+
+            waf_inspect request  json-strict wave=0 timeout=1000ms;
+            waf_inspect response json-strict wave=0 timeout=1000ms;
+            waf_archive request headers args body ttl=1h when=deny;
+
+            proxy_pass http://backend/echo/;
+            proxy_set_header Host $host;
+        }
+
+        # Код ответа вне спеки: приложение отвечает 503, а операция /fail
+        # объявляет только 200. На strict это отказ -- 502, потому что виноват
+        # апстрим, а не клиент.
+        location = /json-strict/fail {
+            waf_capture request  headers args body;
+            waf_capture response headers body=64k;
+
+            waf_inspect request  json-strict wave=0 timeout=1000ms;
+            waf_inspect response json-strict wave=0 timeout=1000ms;
+
+            proxy_pass http://backend/status/503;
+            proxy_set_header Host $host;
+        }
+
+        # Наблюдение: вердикт считается целиком и остаётся в аудите
+        # (would_verdict), наружу всегда allow. Так профиль калибруют на живом
+        # трафике, не заперев клиентов.
+        location /json-observe/ {
+            waf_capture request  headers args body;
+            waf_capture response headers body=64k;
+
+            waf_inspect request  json-observe wave=0 timeout=1000ms;
+            waf_inspect response json-observe wave=0 timeout=1000ms;
+
+            proxy_pass http://backend/echo/;
+            proxy_set_header Host $host;
+        }
+
+        # Усечение, ветка отказа: предел тела 256 байт с trim, инспектор
+        # получает префикс и по политике api отвечает deny (JSON_BODY_TRUNCATED).
+        location = /json/trim {
+            waf_capture request headers args body;
+            waf_body_limit request 256 trim;
+
+            waf_inspect request json wave=0 timeout=1000ms;
+
+            proxy_pass http://backend/echo/;
+            proxy_set_header Host $host;
+        }
+
+        # Усечение, ветка пропуска: тот же префикс тела, профиль soft --
+        # непроверяемое проходит с пометкой в аудите.
+        location = /json-soft/trim {
+            waf_capture request headers args body;
+            waf_body_limit request 256 trim;
+
+            waf_inspect request json-soft wave=0 timeout=1000ms;
+
+            proxy_pass http://backend/echo/;
+            proxy_set_header Host $host;
+        }
+
+        # --- счётчик (inspectors/counter) ----------------------------------
+        #
+        # Обе фазы одного инспектора: фаза ответа меряет вхождения obj= в
+        # эхо-ответе (бэкенд отражает строку запроса в поле url) в корзину
+        # stand_objects, фаза запроса судит по её уровню (профиль stand: score
+        # с 45%, deny с 90%). Заголовки запроса нужны осям sess/user; превью
+        # тела ответа -- источнику regex_count.
+        location /counter/ {
+            waf_capture request  headers args;
+            waf_capture response headers body=64k;
+            waf_body_limit response 1m trim;
+
+            waf_inspect request  counter wave=0 timeout=1000ms;
+            waf_inspect response counter wave=0 timeout=1000ms;
+
+            proxy_pass http://backend/echo/;
+            proxy_set_header Host $host;
+        }
+
+        # Мягкий профиль контракта плюс получатель его просьб: инициатор
+        # профиля json просит капчу на счёте выше порога, и капча стоит здесь
+        # второй волной -- ровно чтобы эта просьба была проверяема насквозь,
+        # а не только по логу инспектора.
+        location /json-soft/ {
+            absolute_redirect off;
+            error_page 403 =403 /pages/$waf_deny_name$waf_deny_ext;
+
+            waf_capture request headers args body;
+            waf_body_limit request 1m block;
+
+            waf_inspect request json-soft wave=0 timeout=1000ms;
+            waf_inspect request captcha   wave=1 timeout=20ms weight=0;
+
+            proxy_pass http://backend/echo/;
+            proxy_set_header Host $host;
+        }
+
+        # Цель редиректа капчи. waf off обязателен: иначе капча требует капчу.
+        # Префиксная форма: под ней живут /api, /verify, /status и /c.js.
+        location ^~ /waf/captcha {
+            waf off;
+
+            set $app_captcha captcha-http:8080;
+            proxy_pass http://$app_captcha$request_uri;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # эталон без модуля: healthcheck контейнера не должен зависеть от
+        # состояния waf
+        location = /healthz {
+            waf off;
+        }
+    }
+
+    # Тот же контур целиком под наблюдением: режим задан на уровне сервера, и
+    # все его маршруты наследуют его. Так выкатывают нового инспектора, не
+    # рискуя трафиком.
+    server {
+        listen  8082;
+        root    /var/www;
+
+        waf on;
+        waf_inspect request ip wave=0 timeout=20ms mode=passive;
+
+        set_real_ip_from 0.0.0.0/0;
+        set_real_ip_from ::/0;
+        real_ip_header X-Forwarded-For;
+
+        error_page 400 =400 /pages/$waf_deny_name.html;
+        error_page 403 =403 /pages/$waf_deny_name.html;
+        error_page 429 =429 /pages/$waf_deny_name.html;
+
+        location /pages/ {
+            internal;
+            waf off;
+            ssi on;
+            ssi_types *;
+            root /usr/share/waf;
+            try_files $uri /pages/blocked.html /index.html;
+        }
+
+        location / {
+            waf_archive request headers args body ttl=1h when=deny;
+            try_files $uri $uri/ /index.html;
+        }
+
+        location /app/ {
+            waf_archive request headers args body ttl=1h when=deny;
+            proxy_pass http://backend/;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_read_timeout 90s;
+        }
+
+        location = /healthz {
+            waf off;
+        }
+    }
+
+    # --- тренировочные приложения ------------------------------------------
+    #
+    # Два настоящих приложения за модулем (deploy/docker-compose.yml: dvwa,
+    # juice-shop), каждое на своём порту края. Порт, а не префикс: оба строят
+    # абсолютные пути от корня, и /dvwa/ ломал бы им ссылки на статику.
+    #
+    # Апстрим задан переменной, а не блоком upstream -- см. resolver в начале
+    # http. Хвост $request_uri, а не пустой: с переменной nginx послал бы
+    # апстриму нормализованный $uri, а здесь предмет проверки -- как раз
+    # исходная строка запроса (обход каталога, двойное кодирование, %00).
+    #
+    # На обоих серверах инспектор правил активен: смысл в том, что атака из
+    # учебника до приложения не доходит. Порог 50 -- как на /modsec/. Чтобы
+    # посмотреть, что бы он заблокировал, не трогая трафик, -- mode=passive
+    # на waf_inspect маршрута.
+
+    # DVWA: SQLi, XSS, загрузка файлов, command injection. Первый заход --
+    # /setup.php, кнопка "Create / Reset Database"; вход admin/password.
+    server {
+        listen  8084;
+        root    /var/www;
+
+        waf on;
+        waf_inspect request ip wave=0 timeout=20ms;
+
+        set_real_ip_from 0.0.0.0/0;
+        set_real_ip_from ::/0;
+        real_ip_header X-Forwarded-For;
+
+        error_page 400 =400 /pages/$waf_deny_name.html;
+        error_page 403 =403 /pages/$waf_deny_name.html;
+        error_page 429 =429 /pages/$waf_deny_name.html;
+
+        location /pages/ {
+            internal;
+            waf off;
+            ssi on;
+            ssi_types *;
+            root /usr/share/waf;
+            # Хвост =403, а не /index.html как на серверах выше: там "/" --
+            # статика, а здесь приложение, и фолбэк уводил бы отказ на апстрим.
+            # Каталог отказов на статических краях не раскатан вовсе, так что
+            # ходил бы туда каждый отказ: до приложения доезжал бы запрос
+            # заблокированного клиента, а его заголовки (Set-Cookie, X-Powered-By)
+            # приезжали бы в ответ 403.
+            try_files $uri /pages/blocked.html =403;
+        }
+
+        # Проба HAProxy: waf off, чтобы узел не выпадал из пула из-за шины.
+        location = /healthz {
+            waf off;
+        }
+
+        location / {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=blocked;
+            waf_archive request headers args body ttl=1h when=deny;
+
+            set $app_dvwa dvwa:80;
+            proxy_pass http://$app_dvwa$request_uri;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+
+    # OWASP Juice Shop: SPA поверх JSON REST. Тело здесь -- не довесок к
+    # запросу, а основное содержимое, поэтому архив на отказе берёт и его.
+    server {
+        listen  8085;
+        root    /var/www;
+
+        waf on;
+        waf_inspect request ip wave=0 timeout=20ms;
+
+        set_real_ip_from 0.0.0.0/0;
+        set_real_ip_from ::/0;
+        real_ip_header X-Forwarded-For;
+
+        error_page 400 =400 /pages/$waf_deny_name.html;
+        error_page 403 =403 /pages/$waf_deny_name.html;
+        error_page 429 =429 /pages/$waf_deny_name.html;
+
+        location /pages/ {
+            internal;
+            waf off;
+            ssi on;
+            ssi_types *;
+            root /usr/share/waf;
+            # =403 -- по той же причине, что и на сервере DVWA выше.
+            try_files $uri /pages/blocked.html =403;
+        }
+
+        location = /healthz {
+            waf off;
+        }
+
+        location / {
+            waf_inspect request modsec wave=0 timeout=1000ms;
+            waf_score_deny request 50 response=blocked;
+            waf_archive request headers args body ttl=1h when=deny;
+
+            set $app_juice juice-shop:3000;
+            proxy_pass http://$app_juice$request_uri;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # socket.io держит соединение дольше умолчания в 60s.
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_read_timeout 90s;
+        }
+    }
+}

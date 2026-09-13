@@ -1,0 +1,22 @@
+go 1.25.7
+
+use (
+	./action
+	./agents/haproxy
+	./agents/redis
+	./agents/s3
+	./auth
+	./captcha
+	./cookie
+	./counter
+	./crypto
+	./geo
+	./ip
+	./json
+	./keeper
+	./logger
+	./modsec
+	./node/agent
+	./rewrite
+	./shared
+)

@@ -1,0 +1,44 @@
+# Источник «только код доступа».
+#
+# Личности за общим кодом нет, и это осознанно: задача здесь -- разграничить не
+# людей, а контуры. «Внутрь стенда пускаем тех, кто знает код» -- по-прежнему
+# второй фактор перед приложением, но X-WAF-User он не наполняет.
+#
+# Код стенда -- let-me-in-2fa.
+
+login:
+  uri: /waf/code
+  title: "Код доступа"
+  note: "Контур закрыт кодом. Логин вводить не нужно."
+
+session:
+  ttl: 12h
+  renew_after: 0
+  bind: [subnet]
+  subnet: { v4: 24, v6: 64 }
+
+ticket:
+  ttl: 10m
+
+upstream:
+  user: X-WAF-User
+  groups: X-WAF-Groups
+  method: X-WAF-Auth
+
+provider: code
+
+providers:
+  code:
+    kind: static
+    codes:
+      - "$2a$12$SMWBrvxLC2rBY9pNJ4CLnuEpfgTg63XlN16a8Wn59AseYuLNXR4V6"
+
+lockout:
+  attempts: 5
+  window: 10m
+  lock: 15m
+
+roster:
+  store: redis
+  prefix: "auth:"
+  revoke_refresh: 2s

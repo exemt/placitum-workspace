@@ -1,0 +1,1251 @@
+# Локальное окружение: три edge nginx с модулем и агентом, шина NATS,
+# хранилище тела Redis, HAProxy перед ними и три инспектора -- ip, modsec,
+# vlai. Топология из docs/architecture.md, собранная одной командой.
+#
+# ip и modsec поднимаются всегда: дешёвый адрес и CRS. vlai -- за профилем
+# compose, модель тяжёлая. Волны и комбинации -- отдельные маршруты в
+# nginx.conf (ip → modsec → vlai), не отдельные контейнеры.
+#
+# app -- защищаемое приложение, витрина (../testapp). Одно и настоящее: прежние
+# три (backend-эхо, dvwa, juice-shop) снесены вместе со стендом juice.waf.test.
+# Полигоном оно не притворяется -- нагрузку отражает, но не исполняет: предмет
+# проверки тут вердикт контура, а не дыра в приложении. Что чем кормится --
+# таблица в testapp/README.md.
+#
+# clickhouse -- хранилище аудита. Пишет логгер, не модуль. Схема — logger/schema.
+#
+# redis -- боевой обменник: объекты запроса (заголовки, строка, тело), которые
+# модуль кладёт по локатору waf_store, инспекторы читают в бюджете волны, а
+# агент забирает в архив после вердикта. Ничего другого там не лежит.
+#
+# redis-internal -- внутренний Redis контура, отдельный экземпляр: доставка
+# конфигов (блобы поколений waf.blob.<sha256> для краёв, modsec и ip) и
+# состояние самих инспекторов (корзины капчи и счётчика, роастер калиток:
+# нонсы, отказы, отзыв). Раздельно, чтобы рост служебных ключей не съедал
+# память обменника и наоборот: noeviction у обоих, но сгорают они по-разному.
+#
+# minio -- локальный S3 (роль архива из docs/body-storage.md). Агент рядом
+# пишет пульс WAF_STATUS.store.s3.<id>, как redis-agent для Redis.
+#
+#     docker compose up -d --wait
+
+name: waf
+
+# Инфраструктура -- из core: NATS, Postgres, ClickHouse, оба Redis, MinIO и
+# бутстрап шины. Пути внутри включённого файла считаются от его каталога.
+# Здесь остаётся только то, чем стенд отличается от установки, -- блоки
+# postgres и nats-box в начале services.
+include:
+  - path: ../core/compose/infra.yml
+    # Чем стенд отличается от чистой инфраструктуры: схема контроллера в initdb
+    # у postgres и каталог прогонов у nats-box. Переопределить сервис из
+    # include нельзя (compose отвечает "conflicts with imported resource"),
+    # поэтому установка передаёт свои пути переменными.
+    env_file: core-infra.env
+
+# Потолок на контейнер: 2 ядра и 1 ГБ. Это квота CFS, а не cpuset -- в
+# /proc/cpuinfo по-прежнему все ядра хоста, поэтому worker_processes auto
+# на nginx всё равно насчитал бы 16. Число воркеров задано явно в nginx.conf.
+x-resources: &resources
+  cpus: "2.0"
+  mem_limit: 1g
+
+# Общая спецификация трёх edge nginx. Не сервис: x-* на верхнем уровне compose.
+x-nginx: &nginx
+  <<: *resources
+  build:
+    context: ../nginx/module
+    target: runtime
+    args:
+      NGINX_VERSION: "${NGINX_VERSION:-1.28.0}"
+  depends_on:
+    nats:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    # CRS компилируется секунды: запрос до конца компиляции увидел бы
+    # политику waf_deadline, а не вердикт. ip поднимается быстрее, но ждём
+    # healthy оба -- иначе первая волна на /ip-modsec/ бьёт в пустоту.
+    inspector-modsec:
+      condition: service_healthy
+    inspector-ip:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/healthz"]
+    interval: 5s
+    timeout: 2s
+    retries: 5
+    start_period: 5s
+
+  # Временный файл тела -- в памяти, не на диске. Тело крупнее
+  # client_body_buffer_size (16k по умолчанию) nginx кладёт в
+  # client_body_temp_path, и модуль дочитывает его оттуда ngx_read_file() --
+  # синхронно, в цикле событий (docs/nginx/module/known-issues.md). На tmpfs
+  # это копирование из страничного кеша: путь чтения из файла остаётся живым,
+  # его по-прежнему проверяет tests/body, а диска в нём больше нет.
+  #
+  # size обязателен: страницы tmpfs -- память контейнера, то есть тот же
+  # гигабайт из x-resources, и без предела разросшийся каталог утащит воркеров
+  # в OOM. uid/gid/mode повторяют каталог из образа (drwx------ nginx:nginx,
+  # uid 101): монтирование подменяет его новым и пустым, и без владельца
+  # воркеры, работающие под nginx, потеряли бы право записи.
+  tmpfs:
+    - /var/cache/nginx/client_temp:rw,size=64m,mode=0700,uid=101,gid=101
+
+# Архив и шина — в nginx/agent/agent.conf. Один файл на три ноды; имя
+# задаёт WAF_NODE_ID. Реквизиты S3 по-прежнему секретом, не строкой конфига.
+x-agent-env: &agent-env
+  WAF_AGENT_CONFIG: /etc/waf/agent.conf
+  # Сайдкар ведёт аудит, архив и пульс, но не конфигурацию: конфиг nginx-1..3
+  # лежит файлом в репозитории, а `nginx -t` и `nginx -s reload` требуют того
+  # же бинаря с модулем, которого в контейнере агента нет. Без этого нода
+  # вечно репортила бы apply_failed, хотя всё остальное на ней работает.
+  # Управляемая нода -- edge-managed, там агент стоит на самой ноде и это on.
+  WAF_NGINX_MANAGE: "off"
+  # Журнал агента ноды -- в waf.log (service=agent); стартовый порог, живьём
+  # его переставляет «Журналы → Уровни». WAF_NGINX_DEBUG=on поднимает мастер
+  # из nginx-debug (nginx/managed/entrypoint.sh) -- отладка ядра, рестартом.
+  WAF_AGENT_LOG: info
+  WAF_NGINX_DEBUG: "off"
+
+x-agent: &agent
+  <<: *resources
+  build:
+    context: ../nginx/agent
+  depends_on:
+    nats:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+    # Правила удаления -- до первого PUT: без них хранилище не назовёт срок
+    # объекта, и в первых записях его не окажется.
+    minio-mc:
+      condition: service_healthy
+  # Приватный ключ контура — только агентам. Контроллер видит публичную
+  # половину и отдаёт её GET /api/<scope>/crypto.
+  #
+  # Реквизиты архива тоже файлом, а не переменной: окружение процесса видно
+  # соседям по машине и уезжает в дампы. На стенде тот же пароль стоит открытым
+  # у самого minio — здесь важна форма, а не тайна.
+  secrets:
+    - waf_node_key
+    - waf_s3_creds
+
+# Управляемый край: nginx с модулем и агент в одном контейнере, конфиг ведёт
+# контроллер (WAF_NGINX_MANAGE=on). Общее у трёх краёв: образ, секреты, tmpfs,
+# зависимости. Различаются node_id, файл ноды и тома. Свежая нода тянет текущее
+# поколение из JetStream KV сама -- рассылать вручную не нужно.
+x-managed: &managed
+  <<: *resources
+  build:
+    context: ../nginx
+    dockerfile: managed/Dockerfile
+    args:
+      NGINX_VERSION: "${NGINX_VERSION:-1.28.0}"
+  secrets:
+    - waf_node_key
+    - waf_s3_creds
+  depends_on:
+    nats:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    # Блобы поколения агент берёт из внутреннего Redis (agent.conf, redis.internal).
+    redis-internal:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+    minio-mc:
+      condition: service_healthy
+  tmpfs:
+    - /var/cache/nginx/client_temp:rw,size=64m,mode=0700,uid=101,gid=101
+
+services:
+
+  # Читает WAF_AUDIT целиком: якорь агента в waf.audit, детали инспекторов в
+  # waf.audit_finding. Миграции — свои.
+  #
+  # Реплик может быть сколько угодно: durable consumer у потока один на всех,
+  # и сообщения он раздаёт по кругу, но событий, ждущих друг друга, у логгера
+  # нет — каждое само по себе становится строкой. Пока это было не так, второй
+  # экземпляр рвал запросы пополам между процессами.
+  #
+  # Durable consumer сменил имя на logger-audit-v2: filter subject у
+  # существующего consumer'а JetStream не меняет, а читать надо уже не только
+  # waf.audit.request.>. Старый consumer после обновления остаётся висеть
+  # пустым — снять вручную, см. docs/deploy/README.md.
+  logger:
+    <<: *resources
+    scale: 2
+    build:
+      context: ../logger
+    image: placitum/logger
+    environment:
+      WAF_NATS_URL: nats://nats:4222
+      # Журнал логгера -- в тот же waf.log (кроме разбора WAF_LOG, см.
+      # cmd/logger); живьём порог переставляет «Журналы → Уровни».
+      WAF_LOGGER_LOG: info
+      CLICKHOUSE_ADDR: clickhouse:9000
+      CLICKHOUSE_USER: waf
+      CLICKHOUSE_PASSWORD: waf
+      CLICKHOUSE_DB: waf
+      # Куда словари страны и ASN ходят за каталогом. Читает их сам
+      # ClickHouse (logger/schema/022, 023), логгер только подставляет адрес
+      # в текст миграции -- инфраструктурным адресам в файле схемы не место.
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: waf
+      POSTGRES_PASSWORD: waf
+      POSTGRES_DB: waf
+    depends_on:
+      nats:
+        condition: service_healthy
+      nats-box:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  # Поиск по waf.audit. Тот же образ, что логгер; в контроллер не кладём.
+  search:
+    <<: *resources
+    # Образ тот же, что у logger, и собирает его тот сервис: две сборки одного
+    # контекста с одним тегом compose не даёт ("image already exists").
+    image: placitum/logger
+    command: ["waf-search"]
+    ports:
+      - "8091:8091"
+    environment:
+      SEARCH_PORT: "8091"
+      # Шина поиску -- только ради журнала: waf.log и живой уровень.
+      WAF_NATS_URL: nats://nats:4222
+      WAF_SEARCH_LOG: info
+      CLICKHOUSE_ADDR: clickhouse:9000
+      CLICKHOUSE_USER: waf
+      CLICKHOUSE_PASSWORD: waf
+      # Только архив: горячий обменник — внутренний контур волны, до записи
+      # аудита он не доживает. Бакеты те же, что у агента (agent.conf):
+      # чего он не архивирует, того поиску и не найти.
+      WAF_STORE_S3_ENDPOINT: http://minio:9000
+      WAF_STORE_S3_REGION: us-east-1
+      WAF_STORE_S3_CREDENTIALS_FILE: /run/secrets/waf_s3_creds
+      WAF_STORE_BUCKET_HEADERS: waf-headers
+      WAF_STORE_BUCKET_ARGS: waf-args
+      WAF_STORE_BUCKET_BODY: waf-bodies
+    secrets:
+      - waf_s3_creds
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      logger:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8091/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 8
+      start_period: 5s
+
+  # Geo/ASN кодер: страна и ASN по адресу, для карточек в UX контроллера.
+  # На горячий путь модуля не встаёт -- inspector-ip читает те же данные
+  # из файла своим WAF_IP_GEO, здесь только справочник для панели.
+  # testdata -- ru/us/jp и несколько ASN для разработки, на них кодер живёт до
+  # первой загрузки. Реальную выгрузку загружают в панели («Наборы адресов →
+  # Гео / ASN → Загрузить данные»): кодер скачивает копию у контроллера в том
+  # geo-copies и переключается на неё, отвечая по прежней до самой подмены.
+  geo:
+    <<: *resources
+    # Полный каталог ASN (660 тыс. префиксов) на квоте 1 ГиБ упирался в предел и
+    # отвечал за 500 мс: сборщик и вытеснение вместо поиска. Памяти не жалко.
+    mem_limit: 4g
+    build:
+      context: ../geo
+    image: placitum/geo
+    ports:
+      - "8092:8092"
+    volumes:
+      - ../geo/testdata/country:/app/data/country:ro
+      - ../geo/testdata/asn:/app/data/asn:ro
+      # Копии выгрузок из панели: кодер поднимается на последней, не дожидаясь контроллера.
+      - geo-copies:/var/lib/waf/geo
+    environment:
+      WAF_NATS_URL: nats://nats:4222
+      # Откуда скачивать выгрузки, загруженные в панель (документ policy/geo в KV).
+      WAF_GEO_CONTROLLER_URL: http://controller:8080
+      WAF_GEO_LOG: info
+      # Мягкий предел кучи ниже предела контейнера: сборщик работает до OOM, а не после.
+      GOMEMLIMIT: 3GiB
+    depends_on:
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8092/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 8
+      start_period: 5s
+
+  # Истина активных наборов: состав в памяти, запись через шину с ответом,
+  # хранилище -- Postgres контроллера (docs/spec.md репозитория keeper). Без него не входят в
+  # калитку и не расходятся баны; зеркала отвечают по последнему состоянию.
+  keeper:
+    <<: *resources
+    # Единственный процесс на все активные наборы: квота инспектора ему мала.
+    # 12.09 на квоте 2 CPU / 1 ГиБ он упирался в обе на записи систем целиком.
+    cpus: "4.0"
+    mem_limit: 2g
+    build:
+      context: ../keeper
+    image: placitum/keeper
+    ports:
+      - "8098:8094"
+    environment:
+      WAF_NATS_URL: nats://nats:4222
+      WAF_KEEPER_DATABASE_URL: postgres://waf:waf@postgres:5432/waf
+      # Состояние активных наборов, пакеты изменений и снапшоты живут во
+      # внутреннем Redis контура; оттуда их читают зеркала -- модуль
+      # (waf_sets_store) и инспекторы. В боевой обменник keeper не ходит.
+      REDIS_INTERNAL_URL: redis://redis-internal:6379
+      WAF_KEEPER_LOG: info
+      # Упаковка снапшота миллиона записей -- под сотню мегабайт разом; без
+      # предела сборщик отпускает кучу до OOM контейнера, а не до него.
+      GOMEMLIMIT: 1536MiB
+      # Пороги очереди и конвейера -- умолчания keeper; здесь для видимости.
+      WAF_KEEPER_QUEUE_MAX: "50000"
+      WAF_KEEPER_BATCH_MAX: "10000"
+      WAF_KEEPER_PIPELINE: "4"
+    depends_on:
+      nats:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis-internal:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8094/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 8
+      start_period: 5s
+    profiles: ["keeper"]
+
+  # Держатель приватного ключа контура рядом с контроллером -- не раскатка
+  # nginx, а расшифровка store-объектов сертификата по запросу контроллера,
+  # см. docs/crypto-service.md. Секрет тот же, что у агентов: contour.key,
+  # публичная половина которого лежит у контроллера отдельно (waf_node_pub).
+  crypto:
+    <<: *resources
+    build:
+      context: ../crypto
+    image: placitum/crypto
+    ports:
+      - "8093:8093"
+    environment:
+      WAF_CRYPTO_HTTP: ":8093"
+      # Шина crypto -- только ради журнала: waf.log и живой уровень. Ключ и
+      # ответы контроллеру по-прежнему ходят по HTTP.
+      WAF_NATS_URL: nats://nats:4222
+      WAF_CRYPTO_LOG: info
+      WAF_NODE_KEY: /run/secrets/waf_node_key
+      WAF_CONTROLLER_URL: http://controller:8080
+    secrets:
+      - waf_node_key
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8093/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 8
+      start_period: 5s
+
+  # Sidecar Redis: PING/INFO и пульс WAF_STATUS.store.redis.<id>.
+  # Не нода: своего WAF_NODE_ID нет. Один образ на оба экземпляра, различаются
+  # адресом и именем -- по нему их и различает страница Состояние.
+  redis-agent:
+    <<: *resources
+    build:
+      context: ../agents/redis
+    image: placitum/agents-redis
+    hostname: redis-agent
+    environment:
+      WAF_NATS_URL: nats://nats:4222
+      REDIS_URL: redis://redis:6379
+      WAF_REDIS_NAME: redis
+      WAF_REDIS_AGENT_LOG: info
+    volumes:
+      - redis-agent-data:/var/lib/waf/agent
+    depends_on:
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  redis-internal-agent:
+    <<: *resources
+    build:
+      context: ../agents/redis
+    image: placitum/agents-redis
+    hostname: redis-internal-agent
+    environment:
+      WAF_NATS_URL: nats://nats:4222
+      REDIS_URL: redis://redis-internal:6379
+      WAF_REDIS_NAME: redis-internal
+      WAF_REDIS_AGENT_LOG: info
+    volumes:
+      # Свой том: id агента лежит в нём, и общий с redis-agent дал бы один
+      # пульс на два хранилища.
+      - redis-internal-agent-data:/var/lib/waf/agent
+    depends_on:
+      redis-internal:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  # Sidecar S3: HeadBucket / admin INFO / prometheus API и пульс WAF_STATUS.store.s3.<id>.
+  # Не нода: своего WAF_NODE_ID нет. Бакеты архива создаёт сам.
+  s3-agent:
+    <<: *resources
+    build:
+      context: ../agents/s3
+    image: placitum/agents-s3
+    hostname: s3-agent
+    environment:
+      WAF_NATS_URL: nats://nats:4222
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: waf
+      S3_SECRET_KEY: wafwafwaf
+      S3_BUCKET: waf-bodies
+      S3_ENSURE_BUCKETS: waf-bodies,waf-headers,waf-args
+      S3_REGION: us-east-1
+      WAF_S3_NAME: s3
+      WAF_S3_AGENT_LOG: info
+    volumes:
+      - s3-agent-data:/var/lib/waf/agent
+    depends_on:
+      minio:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+
+  # Защищаемое приложение стенда: витрина. Обычный апстрим за модулем -- про
+  # контур не знает, вердиктов не выносит и себя не закрывает. Поверхность
+  # расписана в testapp/README.md: карточки с меткой объекта, пагинация,
+  # закрытые разделы под три провайдера входа, контракт /openapi.json, сокет
+  # на обе стороны и опоры для модификатора.
+  #
+  # В depends_on краёв НЕ стоит намеренно, как и прежние приложения: апстрим
+  # ему задан именем, и остановленное приложение не должно мешать nginx
+  # стартовать. Порт наружу -- чтобы сравнить ответ напрямую и через модуль.
+  app:
+    <<: *resources
+    build:
+      context: ../testapp
+    environment:
+      APP_NAME: shop
+      APP_LOG: info
+    ports:
+      - "8083:8080"   # прямой доступ, минуя nginx и модуль
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 3s
+
+  # Три управляемых края за HAProxy: одинаковый образ (nginx+агент, manage=on),
+  # конфиг каждому раскатывает контроллер. Различаются node_id, файл ноды и
+  # тома. Страницы отказа и nginx.conf приезжают поколением, не монтируются.
+  # edge-01 публикует :8086 для прямой отладки; edge-02/03 -- только за
+  # балансером, как в проде.
+  edge-01:
+    <<: *managed
+    hostname: edge-01
+    environment:
+      <<: *agent-env
+      WAF_NODE_ID: edge-01
+      WAF_NGINX_MANAGE: "on"
+    ports:
+      - "8086:8080"   # прямой доступ к ноде для отладки
+    volumes:
+      - ../nginx/agent/agent.conf:/etc/waf/agent.conf:ro
+      - ./nginx/nodes/edge-01.conf:/etc/nginx/waf-node.conf:ro
+      - ./nginx/www:/var/www:ro
+      - edge-01-data:/var/lib/waf/agent
+      - edge-01-store:/var/lib/waf/store
+
+  edge-02:
+    <<: *managed
+    hostname: edge-02
+    environment:
+      <<: *agent-env
+      WAF_NODE_ID: edge-02
+      WAF_NGINX_MANAGE: "on"
+    volumes:
+      - ../nginx/agent/agent.conf:/etc/waf/agent.conf:ro
+      - ./nginx/nodes/edge-02.conf:/etc/nginx/waf-node.conf:ro
+      - ./nginx/www:/var/www:ro
+      - edge-02-data:/var/lib/waf/agent
+      - edge-02-store:/var/lib/waf/store
+
+  edge-03:
+    <<: *managed
+    hostname: edge-03
+    environment:
+      <<: *agent-env
+      WAF_NODE_ID: edge-03
+      WAF_NGINX_MANAGE: "on"
+    volumes:
+      - ../nginx/agent/agent.conf:/etc/waf/agent.conf:ro
+      - ./nginx/nodes/edge-03.conf:/etc/nginx/waf-node.conf:ro
+      - ./nginx/www:/var/www:ro
+      - edge-03-data:/var/lib/waf/agent
+      - edge-03-store:/var/lib/waf/store
+
+  # Контроллер: UX на `/`, API на `/api`. Один origin, без отдельного прокси.
+  # Позже `/` и `/api` разъедут через nginx.
+  controller:
+    <<: *resources
+    build:
+      context: ../controller
+      dockerfile: Dockerfile
+      args:
+        # Пин fingerprint ключа контура для UX: node secrets/gen.mjs --fingerprint,
+        # см. docs/deploy/README.md. Пусто -- сборка не откажет, но UX предупредит оператора.
+        VITE_CONTOUR_FINGERPRINT: ${VITE_CONTOUR_FINGERPRINT:-}
+    ports:
+      - "8080:8080"
+    environment:
+      CONTROLLER_PORT: "8080"
+      CONTROLLER_NAME: controller
+      CONTROLLER_LOG: info
+      CONTROLLER_CORS_ORIGIN: ""
+      CONTROLLER_DATABASE_URL: postgres://waf:waf@postgres:5432/waf
+      CONTROLLER_NATS_URL: nats://nats:4222
+      # k6 в сети compose (loadgen → haproxy:8080). Хост — fallback:
+      # deploy/loadgen/run-host.ps1, тогда host.docker.internal:8090.
+      CONTROLLER_LOADGEN_URL: ${CONTROLLER_LOADGEN_URL:-http://loadgen:8090}
+      CONTROLLER_SEARCH_URL: http://search:8091
+      CONTROLLER_GEO_URL: http://geo:8092
+      # Живые агенты пишут WAF_STATUS сами; фейковых воркеров в этом контуре нет.
+      CONTROLLER_FLEET_DEMO: "0"
+      # Публичная половина. contour.key сюда не монтируется.
+      CONTROLLER_CRYPTO_PUBLIC_KEY: /run/secrets/waf_node_pub
+      # Метаданные сертификата при POST /certificates -- у crypto, не здесь.
+      # Контроллер до и после этого вызова plaintext не видит.
+      CONTROLLER_CRYPTO_SERVICE_URL: http://crypto:8093
+      CONTROLLER_COMPILE_DIR: /app/data/compile
+      # Обменник: печатается в waf_store и показывается панелью; сам контроллер
+      # туда не ходит. Блобы поколений -- во внутренний Redis.
+      CONTROLLER_REDIS_URL: redis://redis:6379
+      CONTROLLER_REDIS_INTERNAL_URL: redis://redis-internal:6379
+    secrets:
+      - waf_node_pub
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      redis-internal:
+        condition: service_healthy
+      search:
+        condition: service_started
+      geo:
+        condition: service_started
+      crypto:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 8
+      start_period: 10s
+
+  # Балансировщик под управлением контроллера: haproxy и агент в одном
+  # контейнере (agents/haproxy). До первой рассылки живёт на bootstrap-конфиге
+  # из образа (тот же состав, что исторический ./haproxy/haproxy.cfg); дальше
+  # агент забирает haproxy.cfg из KV policy/haproxy-conf, проверяет
+  # `haproxy -c` и перечитывает мастер SIGUSR2. Страница панели --
+  # /config/haproxy.
+  haproxy:
+    <<: *resources
+    # Шесть ядер вместо двух из x-resources. На двух HAProxy упирался в 197%
+    # и держал потолок стенда около 1180 rps -- ниже, чем контур за ним, так
+    # что нагрузочные прогоны мерили входную точку, а не WAF.
+    cpus: "6.0"
+    build:
+      context: ../agents/haproxy
+    image: placitum/agents-haproxy
+    ports:
+      - "8081:8080"   # входная точка -> кластер edge-01/02/03 (конфиг из панели)
+      - "8404:8404"   # страница статистики
+    environment:
+      WAF_NATS_URL: nats://nats:4222
+      # Журнал агента -- в waf.log; через его же приёмник (сокет
+      # /var/run/waf/log.sock) туда едет и журнал самого haproxy.
+      WAF_HAPROXY_AGENT_LOG: info
+    depends_on:
+      nats:
+        condition: service_healthy
+      # Ноды без healthcheck (агент раскатывает первое поколение сам); HAProxy
+      # терпит недоступный backend на старте -- resolvers + init-addr.
+      edge-01:
+        condition: service_started
+      edge-02:
+        condition: service_started
+      edge-03:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 5s
+
+  # wrk внутри сети compose: TARGET=haproxy:8080. UX /traffic → /run.
+  # 4 CPU / 1 ГБ: wrk без JS-изолята на соединение.
+  loadgen:
+    <<: *resources
+    cpus: "4.0"
+    mem_limit: 1g
+    build:
+      context: ./loadgen
+    volumes:
+      # Правка генератора не требует пересборки: restart loadgen
+      # перечитывает /app. Каталог кейсов (tests/load/cases.mjs) генератор
+      # перечитывает сам по mtime -- рестарт не нужен и ему.
+      - ./loadgen:/app
+      - ../tests/load:/tests/load:ro
+    # Только на петле хоста: прогон с хоста без панели -- curl :8090/run,
+    # каталог кейсов -- :8090/cases.
+    ports:
+      - "127.0.0.1:8090:8090"
+    environment:
+      TARGET: http://haproxy:8080
+      PORT: "8090"
+      NATS_MONITOR: http://nats:8222
+      LOADGEN_RUNNER: docker
+      LOADGEN_CASES: /tests/load/cases.mjs
+    depends_on:
+      haproxy:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8090/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 8
+      start_period: 5s
+
+  # Инспектор правил SecLang на Coraza со встроенным CRS. Правила настоящие,
+  # вердикт -- из содержимого запроса. Отдельные маршруты в nginx.conf, порог
+  # на них свой: подмешивать счёт CRS к ожидаемым числам ip не нужно.
+  inspector-modsec:
+    <<: *resources
+    scale: 5
+    build:
+      context: ../inspectors/modsec
+      dockerfile: deploy/Dockerfile
+    image: placitum/modsec
+    environment:
+      NATS_URL: nats://nats:4222
+      WAF_MODSEC_SUBJECT: waf.req.modsec
+      WAF_MODSEC_NAME: modsec
+      WAF_MODSEC_LOG: info
+      # Нет такого профиля -- deny. Откат на default пропускал бы трафик
+      # при разъезде тега маршрута и загруженных наборов; в проде это дыра.
+      # Модуль шлёт v:2. Умолчание инспектора было 1 -- каждый запрос
+      # уходил allow с MODSEC_UNSUPPORTED_VERSION, CRS не смотрел вовсе.
+      WAF_MODSEC_VERSIONS: "2"
+      # Применённое поколение с KV. Bootstrap-том профилей остаётся read-only.
+      WAF_MODSEC_DATA: /var/lib/waf/modsec
+      # Единственный в контуре читатель хранилища тел. Тело крупнее
+      # waf_body_inline_max модуль кладёт в Redis и присылает локатор
+      # <node>:<rid>:req; без этого адреса инспектор ответил бы allow с
+      # audit.body = "store_unconfigured", то есть проверка тела молча
+      # выключилась бы. Недостижимый Redis -- ошибка старта, а не сюрприз на
+      # первом теле.
+      # Кодер для инициаторов с write: net|asn (docs/README.md репозитория modsec).
+      WAF_MODSEC_GEO_ADDR: geo:50051
+      # Оба Redis -- блок redis в inspector.conf: тело запроса из обменника
+      # (url), блобы поколения правил (профили, наборы данных, policy) -- из
+      # внутреннего (internal). Env REDIS_URL / REDIS_INTERNAL_URL перекрыл бы файл.
+    volumes:
+      # Профили правятся чаще, чем пересобирается образ: правка плюс
+      # docker compose restart inspector-modsec перечитывает их целиком.
+      - ../inspectors/modsec/profiles:/app/profiles:ro
+      - ../inspectors/modsec/status_map.yaml:/app/status_map.yaml:ro
+      - ../inspectors/modsec/inspector.conf:/app/inspector.conf:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+      nats-box:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-internal:
+        condition: service_healthy
+
+  # Инспектор адреса: гео и списки из файлов, в памяти, перечитываются сами.
+  # На дефолтном маршруте -- он: из сети compose $remote_addr в allowlist.
+  # Свои маршруты -- /ip*, адрес подменяется realip из X-Forwarded-For.
+  inspector-ip:
+    <<: *resources
+    # Восемь копий на время нагрузочного прогона ip-ban (12.09): три упирались
+    # в процессор на записи подсетей и систем.
+    scale: 8
+    build:
+      context: ../inspectors/ip
+      dockerfile: deploy/Dockerfile
+    image: placitum/ip
+    environment:
+      NATS_URL: nats://nats:4222
+      WAF_IP_SUBJECT: waf.req.ip
+      WAF_IP_NAME: ip
+      WAF_IP_LOG: info
+      WAF_IP_VERSIONS: "2"
+      WAF_IP_POLICY: /app/policy
+      WAF_IP_GEO: /app/data/geo
+      # Куда ложится поколение с контроллера и где лежат тела наборов.
+      # Пустой WAF_IP_DATA выключил бы канал: тогда работает дерево из образа.
+      WAF_IP_DATA: /app/state
+      # Тела наборов и объекты keeper -- во внутреннем Redis, адрес -- блок
+      # redis в inspector.conf (internal). В обменник адресный инспектор не
+      # ходит вовсе: адрес едет в сообщении.
+      # Кодер для строк с write: net | net_all | asn (docs/ip-profiles.md):
+      # анонсы и состав системы по адресу клиента. Не WAF_IP_GEO -- тот
+      # каталог статических паков для условий наборов.
+      WAF_IP_GEO_ADDR: geo:50051
+    volumes:
+      # Демо-политика и гео стенда -- deploy/ip: в образе только то, что
+      # поставка не даёт удалить (default без правил, пустые пресеты
+      # списков). Правка не требует ни пересборки, ни рестарта: процесс
+      # опрашивает отпечаток раз в секунду.
+      - ./ip/data:/app/data:ro
+      - ./ip/policy:/app/policy:ro
+      - ../inspectors/ip/inspector.conf:/app/inspector.conf:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis-internal:
+        condition: service_healthy
+
+  # Каталог для провайдера ldap калитки. Не часть продукта -- это тот
+  # контроллер домена, которого на стенде иначе нет: без него провайдер можно
+  # проверить только тем, что он корректно не смог соединиться.
+  #
+  # Дерево заводится bootstrap-ldif при первом старте. --copy-service нужен
+  # потому, что каталог примонтирован read-only, а образ правит файлы у себя.
+  ldap:
+    <<: *resources
+    image: osixia/openldap:1.5.0
+    command: ["--copy-service"]
+    environment:
+      LDAP_ORGANISATION: "WAF stand"
+      LDAP_DOMAIN: corp.example.com
+      LDAP_ADMIN_PASSWORD: admin-secret
+      LDAP_CONFIG_PASSWORD: config-secret
+      # Служебная запись для поиска. Своей записью в bootstrap-ldif не
+      # обойтись: ACL образа по умолчанию -- "to * by self read ... by * none",
+      # и обычный пользователь не видит чужих веток. Этот флаг заводит
+      # cn=svc-waf,<base> и правит ACL под него.
+      LDAP_READONLY_USER: "true"
+      LDAP_READONLY_USER_USERNAME: svc-waf
+      LDAP_READONLY_USER_PASSWORD: svc-secret
+      # TLS выключен: локальный стенд без сертификатов, и профиль ходит по
+      # ldap://. В бою -- ldaps:// либо start_tls, см. профиль ldap.
+      LDAP_TLS: "false"
+    volumes:
+      - ./ldap/bootstrap:/container/service/slapd/assets/config/bootstrap/ldif/custom:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "ldapsearch",
+          "-x",
+          "-H",
+          "ldap://127.0.0.1:389",
+          "-D",
+          "cn=admin,dc=corp,dc=example,dc=com",
+          "-w",
+          "admin-secret",
+          "-b",
+          "dc=corp,dc=example,dc=com",
+          "-s",
+          "base",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Калитка второго фактора (inspectors/auth): инспектор на шине. Ему нужен
+  # обменник -- cookie сессии едет локатором store.headers, инлайном заголовки не
+  # ходят. Без REDIS_URL процесс не поднимается: калитка, которая не видит
+  # cookie, уводит на форму даже вошедших.
+  inspector-auth:
+    <<: *resources
+    scale: 2
+    build:
+      context: ../inspectors/auth
+      dockerfile: deploy/Dockerfile
+    image: placitum/auth
+    environment:
+      NATS_URL: nats://nats:4222
+      WAF_AUTH_SUBJECT: waf.req.auth
+      WAF_AUTH_NAME: auth
+      WAF_AUTH_LOG: info
+      WAF_AUTH_VERSIONS: "2"
+      WAF_AUTH_PROFILES: /app/profiles
+      # Ключ подписи общий с auth-http и не генерируется на старте: две
+      # реплики выписали бы взаимно непроверяемые токены.
+      WAF_AUTH_KEY_FILE: /run/secrets/waf_auth_hmac
+      # Сервис формы: в режиме gate.inline инспектор берёт у него форму
+      # внутренним запросом и отдаёт модулю телом отказа.
+      WAF_AUTH_HTTP_URL: http://auth-http:8080
+      # Поколение профилей из контроллера. Каталог -- записываемый слой
+      # контейнера, а не общий том: у каждой реплики своя копия дерева, иначе
+      # они переименовывают .next друг у друга под руками. Том с
+      # bootstrap-профилями остаётся только для чтения.
+      WAF_AUTH_DATA: /var/lib/waf/auth
+      # Кодер для записей в набор с write: net | net_all | asn
+      # (docs/README.md репозитория auth): анонсы и состав системы по адресу клиента.
+      WAF_AUTH_GEO_ADDR: geo:50051
+    secrets:
+      - waf_auth_hmac
+    volumes:
+      # Профиль правится чаще, чем пересобирается образ: правка подхватывается
+      # без рестарта, процесс опрашивает отпечаток каталога раз в секунду.
+      # Демо-профили стенда: в образ и в репозиторий auth они не едут, профили
+      # доставляет контроллер поколением (решение 12.09).
+      - ./auth/profiles:/app/profiles:ro
+      - ../inspectors/auth/inspector.conf:/app/inspector.conf:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Она же, вторым контейнером: форма входа за location с waf off. Отдельный
+  # процесс, потому что bcrypt и bind к каталогу не помещаются в бюджет волны.
+  # Одна реплика: nginx резолвит имя апстрима один раз при старте.
+  auth-http:
+    <<: *resources
+    scale: 1
+    # Образ тот же, что у inspector-auth: собирает его тот сервис, здесь только
+    # тег -- две сборки одного контекста с одним тегом compose не даёт.
+    image: placitum/auth
+    command: ["auth-http"]
+    environment:
+      WAF_AUTH_NAME: auth
+      WAF_AUTH_LOG: info
+      WAF_AUTH_PROFILES: /app/profiles
+      WAF_AUTH_WEB: /app/web
+      WAF_AUTH_LISTEN: ":8080"
+      WAF_AUTH_KEY_FILE: /run/secrets/waf_auth_hmac
+      # Ключ удостоверения для приложения -- отдельный от ключа сессии. Тем же
+      # нельзя: приложение обязано открыть удостоверение, а с ключом сессии
+      # оно выписало бы себе вход.
+      WAF_AUTH_APP_KEY_FILE: /run/secrets/waf_auth_app
+      # Локальный стенд без TLS: с Secure cookie сессии не вернулась бы по
+      # http, и цикл входа не замкнулся бы. То же решение, что secure=off в
+      # waf_cookie_defaults nginx.conf.
+      WAF_AUTH_COOKIE_SECURE: "off"
+      # Роастер (нонсы, отказы, отзыв) -- во внутреннем Redis, адрес в
+      # inspector.conf (блок redis, internal). Обменник форме не нужен: заголовки
+      # запроса читает инспектор, а не она.
+      # Пароль служебной записи каталога: профиль называет только имя
+      # переменной, потому что сам профиль лежит в git и уезжает в KV.
+      WAF_AUTH_LDAP_PASSWORD: svc-secret
+      WAF_AUTH_DATA: /var/lib/waf/auth
+      # Ссылки store: в профиле открывает форма -- такой же держатель ключа
+      # контура, как агент на ноде и crypto-сервис. Пространство названо
+      # именем: uuid у каждой установки свой.
+      WAF_AUTH_CONTROLLER: http://controller:8080
+      WAF_AUTH_SCOPE: name:default
+      WAF_AUTH_CONTOUR_KEY: /run/secrets/waf_node_key
+    secrets:
+      - waf_auth_hmac
+      - waf_auth_app
+      - waf_node_key
+    volumes:
+      - ./auth/profiles:/app/profiles:ro
+      - ../inspectors/auth/web:/app/web:ro
+      - ../inspectors/auth/inspector.conf:/app/inspector.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      redis-internal:
+        condition: service_healthy
+      ldap:
+        condition: service_healthy
+
+  # Капча (inspectors/captcha): инспектор на шине. Тот же каркас, что у
+  # калитки: обменник обязателен, ключ общий с captcha-http и только с ним.
+  # Контракт API (inspectors/json): тело и вызов сверяются с OpenAPI или
+  # отдельной JSON Schema. Единственный инспектор контура, которому нужно
+  # тело **целиком**: префикс документа невалиден всегда, и политика на
+  # усечение у профиля своя (см. docs/inspectors/json/README.md).
+  #
+  # Redis обязателен по той же причине, что у modsec: тело едет локатором, и
+  # без адреса обменника проверять было бы нечего.
+  inspector-json:
+    <<: *resources
+    scale: 2
+    build:
+      context: ../inspectors/json
+      dockerfile: deploy/Dockerfile
+    image: placitum/json
+    environment:
+      NATS_URL: nats://nats:4222
+      WAF_JSON_SUBJECT: waf.req.json
+      WAF_JSON_NAME: json
+      WAF_JSON_LOG: info
+      WAF_JSON_VERSIONS: "2"
+      WAF_JSON_PROFILES: /app/profiles
+      WAF_JSON_DATA: /var/lib/waf/json
+      # Нет такого профиля -- deny. Откат на default означал бы проверку не
+      # тем контрактом, а это не более мягкая проверка, а проверка не того.
+      # Кодер для инициаторов с write: net|asn -- анонсированная подсеть и
+      # номер системы. Пусто -- такие строки молчат, остальные работают.
+      WAF_JSON_GEO_ADDR: geo:50051
+    volumes:
+      # Профили и спеки правятся чаще, чем пересобирается образ: правка плюс
+      # опрос отпечатка раз в секунду -- и каталог перечитан целиком.
+      - ../inspectors/json/profiles:/app/profiles:ro
+      - ../inspectors/json/inspector.conf:/app/inspector.conf:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # Чистый отправитель канала действий: ничего не проверяет, рассказывает
+  # соседям по правилам профиля. Обменник ему не нужен -- путь и метод едут
+  # инлайном. Одна реплика: работы у него меньше всех.
+  inspector-action:
+    <<: *resources
+    scale: 1
+    build:
+      context: ../inspectors/action
+      dockerfile: deploy/Dockerfile
+    image: placitum/action
+    environment:
+      NATS_URL: nats://nats:4222
+      WAF_ACTION_SUBJECT: waf.req.action
+      WAF_ACTION_NAME: action
+      WAF_ACTION_LOG: info
+      WAF_ACTION_VERSIONS: "2"
+      WAF_ACTION_PROFILES: /app/profiles
+      WAF_ACTION_DATA: /var/lib/waf/action
+      # Оба Redis -- блок redis в inspector.conf: снимок запроса для условий
+      # по заголовкам, кукам и аргументам -- из обменника (url), зеркало
+      # наборов keeper для условий по спискам -- из внутреннего (internal).
+      # Кодер для записей в набор с write: net | net_all | asn
+      # (docs/inspectors/action): анонсы и состав системы по адресу клиента.
+      WAF_ACTION_GEO_ADDR: geo:50051
+    volumes:
+      # Профили стенда -- deploy/action: в образе один default. Правка плюс
+      # опрос отпечатка раз в секунду -- и каталог перечитан целиком.
+      - ./action/profiles:/app/profiles:ro
+      - ../inspectors/action/inspector.conf:/app/inspector.conf:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-internal:
+        condition: service_healthy
+
+  # Кука: выдаёт и снимает Set-Cookie, пишет её значение в живые наборы и
+  # рассказывает соседям. Обе фазы -- один subject, ветка по phase. Обменник
+  # нужен: Cookie читается из снимка заголовков запроса.
+  inspector-cookie:
+    <<: *resources
+    scale: 1
+    build:
+      context: ../inspectors/cookie
+      dockerfile: deploy/Dockerfile
+    image: placitum/cookie
+    environment:
+      NATS_URL: nats://nats:4222
+      WAF_COOKIE_SUBJECT: waf.req.cookie
+      WAF_COOKIE_NAME: cookie
+      WAF_COOKIE_LOG: info
+      WAF_COOKIE_VERSIONS: "2"
+      WAF_COOKIE_PROFILES: /app/profiles
+      WAF_COOKIE_DATA: /var/lib/waf/cookie
+      # Ключ подписи значений: один на все реплики, иначе кука, выданная
+      # одной, читается другой как подделанная.
+      WAF_COOKIE_SECRET_FILE: /run/secrets/waf_cookie_hmac
+      # Кодер для записей в набор с write: net | net_all | asn.
+      WAF_COOKIE_GEO_ADDR: geo:50051
+    secrets:
+      - waf_cookie_hmac
+    volumes:
+      - ../inspectors/cookie/profiles:/app/profiles:ro
+      - ../inspectors/cookie/inspector.conf:/app/inspector.conf:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-internal:
+        condition: service_healthy
+
+  # Счётчик: фаза ответа меряет в корзины на Redis, фаза запроса судит по
+  # уровням. Обе фазы -- один subject, ветка по phase в сообщении.
+  inspector-counter:
+    <<: *resources
+    scale: 2
+    build:
+      context: ../inspectors/counter
+      dockerfile: deploy/Dockerfile
+    image: placitum/counter
+    environment:
+      NATS_URL: nats://nats:4222
+      WAF_COUNTER_SUBJECT: waf.req.counter
+      WAF_COUNTER_NAME: counter
+      WAF_COUNTER_LOG: info
+      WAF_COUNTER_VERSIONS: "2"
+      WAF_COUNTER_PROFILES: /app/profiles
+      WAF_COUNTER_DATA: /var/lib/waf/counter
+      # Кодер для осей asn_net/asn_router и инициаторов с write: net|asn.
+      # Пусто -- эти оси молчат, остальные работают.
+      WAF_COUNTER_GEO_ADDR: geo:50051
+      # Обменник -- снимок запроса по локатору; корзины -- во внутреннем
+      # Redis, рядом с корзинами капчи. Оба адреса -- блок redis в
+      # inspector.conf (url и internal).
+    volumes:
+      # Профили правятся чаще, чем пересобирается образ: правка плюс опрос
+      # отпечатка раз в секунду -- и каталог перечитан целиком.
+      - ../inspectors/counter/profiles:/app/profiles:ro
+      - ../inspectors/counter/inspector.conf:/app/inspector.conf:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-internal:
+        condition: service_healthy
+
+  # Модификатор ответов: читает тело из обменника, применяет группы профиля и
+  # кладёт переписанную копию под <node>:<rid>:rsp:out -- модуль поднимает её
+  # сам. Одна фаза -- ответ.
+  inspector-rewrite:
+    <<: *resources
+    scale: 2
+    build:
+      context: ../inspectors/rewrite
+      dockerfile: deploy/Dockerfile
+    image: placitum/rewrite
+    environment:
+      NATS_URL: nats://nats:4222
+      WAF_REWRITE_SUBJECT: waf.req.rewrite
+      WAF_REWRITE_NAME: rewrite
+      WAF_REWRITE_LOG: info
+      WAF_REWRITE_VERSIONS: "2"
+      WAF_REWRITE_PROFILES: /app/profiles
+      WAF_REWRITE_DATA: /var/lib/waf/rewrite
+      # Обменник объектов (url блока redis в inspector.conf): и чтение
+      # оригинала, и запись переписанной копии.
+    volumes:
+      # Профили правятся чаще, чем пересобирается образ: правка плюс опрос
+      # отпечатка раз в секунду -- и каталог перечитан целиком.
+      - ../inspectors/rewrite/profiles:/app/profiles:ro
+      - ../inspectors/rewrite/inspector.conf:/app/inspector.conf:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  inspector-captcha:
+    <<: *resources
+    # Восемь копий: воркеров у пула столько, сколько ядер по квоте (два), а
+    # работа с лестницы бана сетевая -- корзина в Redis плюс запись в keeper с
+    # ответом. Пропускная способность = воркеры / время сообщения, и на двух
+    # копиях она упиралась около четырёхсот записей в секунду, после чего
+    # очередь (256 на копию) стояла дольше дедлайна маршрута.
+    # 12.09 свёрнуто до двух на время прогона ip-ban: место под копии адреса.
+    scale: 2
+    build:
+      context: ../inspectors/captcha
+      dockerfile: deploy/Dockerfile
+    image: placitum/captcha
+    environment:
+      NATS_URL: nats://nats:4222
+      WAF_CAPTCHA_SUBJECT: waf.req.captcha
+      WAF_CAPTCHA_NAME: captcha
+      WAF_CAPTCHA_LOG: info
+      WAF_CAPTCHA_VERSIONS: "2"
+      WAF_CAPTCHA_PROFILES: /app/profiles
+      WAF_CAPTCHA_KEY_FILE: /run/secrets/waf_captcha_hmac
+      WAF_CAPTCHA_DATA: /var/lib/waf/captcha
+      # Кодер для ASN-корзин: анонсированная подсеть и номер системы
+      # (docs/inspectors/captcha/buckets.md).
+      # Кодер гео по gRPC: анонсы, номер и состав системы для корзин и для
+      # записей write: net | asn. Ожидание синхронное, в бюджете сообщения.
+      WAF_CAPTCHA_GEO_ADDR: geo:50051
+      # Сервис виджета: в режиме gate.inline инспектор берёт у него страницу
+      # внутренним запросом и отдаёт модулю телом отказа.
+      WAF_CAPTCHA_HTTP_URL: http://captcha-http:8080
+      # Обменник -- заголовки запроса по локатору (cookie клиренса); корзины и
+      # роастер -- во внутреннем Redis, общем с captcha-http. Оба адреса --
+      # блок redis в inspector.conf (url и internal).
+    secrets:
+      - waf_captcha_hmac
+    volumes:
+      - ../inspectors/captcha/profiles:/app/profiles:ro
+      - ../inspectors/captcha/inspector.conf:/app/inspector.conf:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-internal:
+        condition: service_healthy
+
+  # Она же, вторым контейнером: страница виджета и проверка ответа за
+  # location с waf off. Одна реплика: nginx резолвит имя один раз.
+  captcha-http:
+    <<: *resources
+    scale: 1
+    # Образ тот же, что у inspector-captcha, и собирает его тот сервис: две
+    # сборки одного контекста с одним тегом compose не даёт.
+    image: placitum/captcha
+    command: ["captcha-http"]
+    environment:
+      NATS_URL: nats://nats:4222
+      WAF_CAPTCHA_NAME: captcha
+      WAF_CAPTCHA_LOG: info
+      WAF_CAPTCHA_PROFILES: /app/profiles
+      WAF_CAPTCHA_WEB: /app/web
+      WAF_CAPTCHA_LISTEN: ":8080"
+      WAF_CAPTCHA_KEY_FILE: /run/secrets/waf_captcha_hmac
+      # Локальный стенд без TLS, как у auth-http.
+      WAF_CAPTCHA_COOKIE_SECURE: "off"
+      WAF_CAPTCHA_DATA: /var/lib/waf/captcha
+      # Корзины и роастер (нонсы, картинки виджета, отказы) -- во внутреннем
+      # Redis, адрес в inspector.conf (блок redis, internal). Обменник виджету не
+      # нужен: заголовки запроса читает инспектор.
+      # Ссылки secret_store внешних провайдеров открывает HTTP -- такой же
+      # держатель ключа контура, как auth-http.
+      WAF_CAPTCHA_CONTROLLER: http://controller:8080
+      WAF_CAPTCHA_SCOPE: name:default
+      WAF_CAPTCHA_CONTOUR_KEY: /run/secrets/waf_node_key
+    secrets:
+      - waf_captcha_hmac
+      - waf_node_key
+    volumes:
+      - ../inspectors/captcha/profiles:/app/profiles:ro
+      - ../inspectors/captcha/web:/app/web:ro
+      - ../inspectors/captcha/inspector.conf:/app/inspector.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/waf/captcha/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      redis-internal:
+        condition: service_healthy
+
+  # Классификатор серьёзности описания (inspectors/vlai). Не в depends_on
+  # nginx и не в e2e: модель тяжёлая, вердикт -- score по тексту бюллетеня,
+  # не по HTTP-атаке. Свои маршруты -- /vlai*. Профиль vlai, иначе
+  # `compose up --wait` будет ждать загрузку весов. GPU -- образ
+  # placitum/vlai:cuda и --gpus all, см. docs/README.md репозитория vlai.
+  inspector-vlai:
+    profiles: ["vlai"]
+    cpus: "2.0"
+    mem_limit: 4g
+    scale: 1
+    build:
+      context: ../inspectors/vlai
+      dockerfile: deploy/Dockerfile
+    image: placitum/vlai
+    environment:
+      NATS_URL: nats://nats:4222
+      WAF_VLAI_SUBJECT: waf.req.vlai
+      WAF_VLAI_NAME: vlai
+      WAF_VLAI_LOG: info
+      WAF_VLAI_VERSIONS: "2"
+      VLAI_DEVICE: cpu
+      # Кодер для правил событий с write: net | net_all | asn -- по HTTP,
+      # поле в поле с gRPC Go-инспекторов (docs/README.md репозитория vlai).
+      WAF_VLAI_GEO_URL: http://geo:8092
+      # Тот же адрес, что в блоке redis у inspector.conf: инспектору переменная
+      # ничего не меняет. Нужна пробе healthcheck -- она кладёт тело в обменник
+      # ключами модуля и берёт адрес только из REDIS_URL. Без переменной store
+      # уезжает пустым, инспектор отвечает VLAI_NO_TEXT вместо score, и
+      # контейнер вечно unhealthy при живом инспекторе.
+      REDIS_URL: redis://redis:6379
+    volumes:
+      - vlai-checkpoint:/var/lib/waf/vlai
+      - ../inspectors/vlai/inspector.conf:/app/inspector.conf:ro
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  geo-copies:
+  edge-01-data:
+  edge-01-store:
+  edge-02-data:
+  edge-02-store:
+  edge-03-data:
+  edge-03-store:
+  redis-agent-data:
+  redis-internal-agent-data:
+  s3-agent-data:
+  vlai-checkpoint:
+    name: waf-vlai-checkpoint
+
+# Пара из secrets/: node gen.mjs. Приватный — агентам, публичный — контроллеру.
+secrets:
+  waf_node_key:
+    file: ./secrets/contour.key
+  waf_node_pub:
+    file: ./secrets/contour.pub
+  waf_s3_creds:
+    file: ./secrets/s3.creds
+  # Ключ подписи сессий калитки. Общий у inspector-auth и auth-http и больше
+  # ни у кого: у челленджа и капчи свои ключи.
+  #     openssl rand -hex 32 > secrets/auth.hmac
+  waf_auth_hmac:
+    file: ./secrets/auth.hmac
+  # Ключ удостоверения приложения: его знает и приложение, и калитка. Ключ
+  # сессии ему не отдают.
+  waf_auth_app:
+    file: ./secrets/auth-app.hmac
+  # Ключ капчи. Общий у inspector-captcha и captcha-http, с auth и
+  # челленджем не делится.
+  #     openssl rand -hex 32 > secrets/captcha.hmac
+  waf_captcha_hmac:
+    file: ./secrets/captcha.hmac
+  # Ключ подписи значений кук. Свой: по куке инспектора решают соседи, и
+  # делить её подпись с сессией калитки незачем.
+  #     openssl rand -hex 32 > secrets/cookie.hmac
+  waf_cookie_hmac:
+    file: ./secrets/cookie.hmac

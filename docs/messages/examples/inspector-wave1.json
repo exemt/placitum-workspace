@@ -1,0 +1,76 @@
+{
+  "v": 2,
+  "rid": "480000013b000000",
+  "ray": "7b21c0a8-f3e1-4d5a-8c2e-91b04f6a1d03",
+  "phase": "request",
+  "wave": 1,
+  "inspector": "challenge",
+  "deadline_ms": 12,
+  "audit_subject": "waf.audit.inspector.challenge",
+  "node": "nginx-1",
+  "conn": {
+    "client_ip": "203.0.113.77",
+    "client_port": 54233,
+    "server_ip": "10.0.0.8",
+    "server_port": 8080,
+    "tls": {
+      "version": "TLSv1.3",
+      "sni": "shop.example.com"
+    }
+  },
+  "http": {
+    "method": "POST",
+    "scheme": "https",
+    "host": "shop.example.com",
+    "uri": "/api/orders",
+    "args_size": 4,
+    "version": "HTTP/1.1"
+  },
+  "vars": {
+    "ua": "curl/8.5.0"
+  },
+  "needs": [
+    "headers"
+  ],
+  "store": {
+    "headers": {
+      "size": 64,
+      "store": "hot",
+      "driver": "redis",
+      "key": "nginx-1:480000013b000000:req:hdr"
+    },
+    "args": null,
+    "body": null
+  },
+  "route": {
+    "server_name": "shop.example.com",
+    "location": "/api/",
+    "profile": "default"
+  },
+  "score": {
+    "total": 50,
+    "deny_at": 100
+  },
+  "prior": [
+    {
+      "inspector": "modsec",
+      "verdict": "score",
+      "score": 50
+    }
+  ],
+  "sessions": [
+    {
+      "inspector": "auth",
+      "source": "corp",
+      "kind": "own",
+      "user": "alice",
+      "id": "k7f3c1e0",
+      "verified": true,
+      "groups": [
+        "ops"
+      ],
+      "issued": 1757232000,
+      "expires": 1757260800
+    }
+  ]
+}

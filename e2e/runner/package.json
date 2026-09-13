@@ -1,0 +1,16 @@
+{
+  "name": "waf-e2e-runner",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Структурированный e2e-раннер: сброс/заливка конфига через API, проверка через API, трафик, проверка хранилищ, отчёт.",
+  "scripts": {
+    "test:modsec": "node scenarios/modsec.mjs",
+    "test:response": "node scenarios/response.mjs",
+    "test:convergence": "node scenarios/convergence.mjs",
+    "test:changes": "node scenarios/changes.mjs"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.1"
+  }
+}

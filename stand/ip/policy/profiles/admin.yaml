@@ -1,0 +1,7 @@
+# Только частные сети: всё остальное -- deny.
+rules:
+  - set: not-office
+    action: deny
+    response: blocked
+
+default: allow

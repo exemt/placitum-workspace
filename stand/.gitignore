@@ -1,0 +1,2 @@
+# Пин контура: значение зависит от локального contour.pub (см. secrets/.gitignore).
+.env

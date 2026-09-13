@@ -1,0 +1,74 @@
+{
+  "v": 1,
+  "kind": "request",
+  "ray": "3f9c1e77-2a48-4b16-9d0c-5e7a10c8b442",
+  "node": "nginx-1",
+  "phase": "request",
+  "ts": "2026-08-15T21:44:12.907Z",
+  "client_ip": "203.0.113.77",
+  "client_port": 54611,
+  "server_ip": "10.0.0.8",
+  "server_port": 443,
+  "tls": {
+    "version": "TLSv1.3",
+    "sni": "shop.example.com"
+  },
+  "http": {
+    "method": "POST",
+    "scheme": "https",
+    "host": "shop.example.com",
+    "uri": "/api/orders",
+    "version": "HTTP/1.1",
+    "args_size": 0,
+    "headers_size": 96,
+    "headers_count": 11,
+    "body_size": 4096,
+    "content_type": "application/json",
+    "status": 403
+  },
+  "route": {
+    "server_name": "shop.example.com",
+    "location": "/api/orders"
+  },
+  "verdict": "deny",
+  "code": "inspector",
+  "by": "modsec",
+  "inspectors": {
+    "module": { "verdict": "deny" },
+    "modsec": {
+      "verdict": "deny",
+      "latency_ms": 6.1,
+      "profile": "strict"
+    }
+  },
+  "vars": {
+    "ua": "curl/8.5.0",
+    "country": "NL"
+  },
+  "store": {
+    "headers": {
+      "size": 96,
+      "store": "archive",
+      "driver": "s3",
+      "key": "2026/08/15/nginx-1/3f9c1e77-2a48-4b16-9d0c-5e7a10c8b442.hdr",
+      "expires_at": 1789344000
+    },
+    "args": null,
+    "body": {
+      "size": 4096,
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "complete": false,
+      "truncated": true,
+      "encoding": "identity",
+      "store": "archive",
+      "driver": "s3",
+      "key": "2026/08/15/nginx-1/3f9c1e77-2a48-4b16-9d0c-5e7a10c8b442.body",
+      "expires_at": 1802304000
+    },
+    "archive": {
+      "headers": { "ttl": 2592000 },
+      "body": { "ttl": 15552000, "limit": 2048 }
+    }
+  },
+  "waf_latency_us": 8100
+}

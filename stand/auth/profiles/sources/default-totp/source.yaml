@@ -1,0 +1,64 @@
+# Второй фактор как отдельный источник: стоит на маршруте второй волной после
+# default и спрашивает только код. Личность -- из сессии источника default
+# (тот же процесс, тот же ключ), секрет TOTP -- из того же файла пользователей
+# по логину. Cookie отличаются от default сами собой: умолчания на источник
+# (waf_sid_default-totp против waf_sid_default), иначе второй вход стёр бы
+# сессию первого.
+
+login:
+  uri: /waf/login-totp
+  title: "Второй фактор"
+  note: "Введите код из приложения-аутентификатора."
+
+session:
+  ttl: 8h
+  renew_after: 1h
+  bind: [subnet, ua]
+
+ticket:
+  ttl: 10m
+
+# Быстрый путь объявляет последний источник маршрута: запись в списке означает
+# полный вход, а не только пароль. Форма кладёт сюда куку при входе и убирает
+# при выходе; маршрут объявляет
+#
+#     waf_inspect request auth ... if $cookie_waf_sess not in auth_sessions;
+#
+# Внимание: в списке оказываются все вошедшие источника. Маршрут профиля с
+# gate.groups условие быстрого пути ставить не должен -- локальный слой групп
+# не проверяет; контроллер такую пару не выпускает.
+list:
+  sessions: auth_sessions
+  cookie: waf_sess
+  ttl: 8h
+  origin: auth
+
+upstream:
+  user: X-WAF-User
+  groups: X-WAF-Groups
+  method: X-WAF-Auth
+  cookie: waf_id
+  ttl: 8h
+
+provider: code
+
+identity:
+  from: default
+
+providers:
+  code:
+    kind: totp
+    digits: 6
+    period: 30s
+    skew: 1
+    users: ../default/users.yaml
+
+lockout:
+  attempts: 5
+  window: 10m
+  lock: 15m
+
+roster:
+  store: redis
+  prefix: "auth:"
+  revoke_refresh: 2s

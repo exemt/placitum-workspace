@@ -1,0 +1,79 @@
+{
+  "ray": "11d4ea9c-80b2-4c7e-9f01-6a5b4c3d2e10",
+  "node": "nginx-1",
+  "phase": "request",
+  "ts": "2026-08-15T21:42:31.660Z",
+  "client_ip": "203.0.113.77",
+  "client_port": 54233,
+  "server_ip": "10.0.0.8",
+  "server_port": 443,
+  "tls": {
+    "version": "TLSv1.3",
+    "sni": "shop.example.com"
+  },
+  "http": {
+    "method": "POST",
+    "scheme": "https",
+    "host": "shop.example.com",
+    "uri": "/api/orders",
+    "version": "HTTP/1.1",
+    "args_size": 37,
+    "headers_size": 96,
+    "headers_count": 11,
+    "body_size": 812,
+    "content_type": "application/x-www-form-urlencoded",
+    "status": 403
+  },
+  "route": {
+    "server_name": "shop.example.com",
+    "location": "/api/"
+  },
+  "verdict": "deny",
+  "code": "score",
+  "by": "module",
+  "score": {
+    "total": 80,
+    "deny_at": 50,
+    "shadow": 40
+  },
+  "inspectors": {
+    "module": { "verdict": "deny" },
+    "modsec": {
+      "verdict": "score",
+      "score": 50,
+      "latency_ms": 4.2,
+      "profile": "strict"
+    },
+    "probe": {
+      "verdict": "score",
+      "score": 60,
+      "latency_ms": 2.9
+    },
+    "ml": {
+      "verdict": "score",
+      "score": 40,
+      "latency_ms": 7.5,
+      "role": "passive"
+    }
+  },
+  "vars": {
+    "ua": "curl/8.5.0",
+    "country": "NL"
+  },
+  "store": {
+    "headers": {
+      "size": 96
+    },
+    "args": {
+      "size": 37
+    },
+    "body": {
+      "size": 812,
+      "sha256": "d2a84f4b8b650937ec8f73cd8be2c74add5a911ba64df27458ed8229da804a26",
+      "complete": true,
+      "truncated": false,
+      "encoding": "identity"
+    }
+  },
+  "waf_latency_us": 9100
+}

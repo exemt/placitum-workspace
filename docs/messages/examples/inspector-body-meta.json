@@ -1,0 +1,46 @@
+{
+  "v": 2,
+  "rid": "480000013b000000",
+  "ray": "7b21c0a8-f3e1-4d5a-8c2e-91b04f6a1d03",
+  "phase": "request",
+  "wave": 0,
+  "inspector": "size",
+  "deadline_ms": 18,
+  "audit_subject": null,
+  "node": "nginx-1",
+  "conn": {
+    "client_ip": "203.0.113.77",
+    "client_port": 54233,
+    "server_ip": "10.0.0.8",
+    "server_port": 8080
+  },
+  "http": {
+    "method": "POST",
+    "scheme": "https",
+    "host": "shop.example.com",
+    "uri": "/api/orders",
+    "args_size": 0,
+    "version": "HTTP/1.1"
+  },
+  "needs": ["body"],
+  "store": {
+    "headers": null,
+    "args": null,
+    "body": {
+      "size": 4194304,
+      "sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+      "complete": false,
+      "truncated": true,
+      "encoding": "gzip"
+    }
+  },
+  "route": {
+    "server_name": "shop.example.com",
+    "location": "/api/",
+    "profile": "default"
+  },
+  "score": {
+    "total": 0,
+    "deny_at": 100
+  }
+}

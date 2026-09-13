@@ -1,0 +1,62 @@
+{
+  "ray": "e8f0a12b-44c1-4a90-b7d6-3c2e1f0a9b55",
+  "node": "nginx-1",
+  "phase": "request",
+  "ts": "2026-08-15T21:41:13.004Z",
+  "client_ip": "203.0.113.77",
+  "client_port": 54233,
+  "server_ip": "10.0.0.8",
+  "server_port": 443,
+  "tls": {
+    "version": "TLSv1.3",
+    "sni": "shop.example.com"
+  },
+  "http": {
+    "method": "GET",
+    "scheme": "https",
+    "host": "shop.example.com",
+    "uri": "/cart",
+    "version": "HTTP/2.0",
+    "args_size": 0,
+    "headers_size": 512,
+    "headers_count": 14,
+    "body_size": 0,
+    "status": 303
+  },
+  "route": {
+    "server_name": "shop.example.com",
+    "location": "/"
+  },
+  "verdict": "redirect",
+  "code": "inspector",
+  "by": "challenge",
+  "score": {
+    "total": 50,
+    "deny_at": 100
+  },
+  "inspectors": {
+    "module": { "verdict": "redirect" },
+    "modsec": {
+      "verdict": "score",
+      "score": 50,
+      "latency_ms": 5.1,
+      "profile": "default"
+    },
+    "challenge": {
+      "verdict": "redirect",
+      "latency_ms": 9.7
+    }
+  },
+  "vars": {
+    "ua": "curl/8.5.0",
+    "country": "NL"
+  },
+  "store": {
+    "headers": {
+      "size": 512
+    },
+    "args": null,
+    "body": null
+  },
+  "waf_latency_us": 11200
+}

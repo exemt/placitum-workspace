@@ -1,0 +1,64 @@
+# Источник с проверкой пароля в каталоге.
+#
+# Пароль здесь не хранит никто в контуре: форма отдаёт его LDAP-серверу
+# операцией bind. Контур знает только, сошлось или нет, и в какие группы
+# пользователь входит.
+#
+# Это отдельный источник, и с default он не дружит: сессия источника ldap не
+# открывает маршруты, чьи профили ссылаются на default, -- и наоборот. Так и
+# задумано: разные каталоги пользователей -- разные вселенные групп и имён.
+#
+# На стенде каталог -- контейнер ldap (osixia/openldap), дерево из
+# deploy/ldap/bootstrap. Вход: ivanov / ldap-demo-2fa. Учётная запись
+# sidorov существует с тем же паролем, но вне группы допуска -- она
+# показывает, что членство проверяется, а не подразумевается.
+
+login:
+  uri: /waf/login-ldap
+  title: "Вход по учётной записи домена"
+  note: "Логин и пароль проверяет каталог организации."
+
+session:
+  ttl: 8h
+  renew_after: 1h
+  bind: [subnet, ua]
+  subnet: { v4: 24, v6: 64 }
+
+ticket:
+  ttl: 10m
+
+upstream:
+  user: X-WAF-User
+  groups: X-WAF-Groups
+  method: X-WAF-Auth
+
+provider: ldap
+
+providers:
+  ldap:
+    # Стенд без TLS. В бою -- ldaps://:636 либо start_tls: true: простой bind
+    # отдаёт пароль по проводу, и открытый ldap:// для него не место.
+    url: ldap://ldap:389
+    start_tls: false
+    # search, а не upn/dn_template: только он позволяет проверить членство и
+    # подтянуть отображаемое имя. upn -- это форма Active Directory
+    # (ivanov@corp.example.com), OpenLDAP её как DN не примет.
+    bind: search
+    timeout: 3s
+    groups: ["cn=waf-users,ou=groups,dc=corp,dc=example,dc=com"]
+    search:
+      base: "dc=corp,dc=example,dc=com"
+      filter: "(&(objectClass=inetOrgPerson)(uid=%s))"
+      bind_dn: "cn=svc-waf,dc=corp,dc=example,dc=com"
+      # Имя переменной, а не пароль: источник лежит в git и уезжает в KV.
+      password_env: WAF_AUTH_LDAP_PASSWORD
+
+lockout:
+  attempts: 5
+  window: 10m
+  lock: 15m
+
+roster:
+  store: redis
+  prefix: "auth:"
+  revoke_refresh: 2s

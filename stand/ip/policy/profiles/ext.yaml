@@ -1,0 +1,7 @@
+# Россия в отказе, офис вычитается: 5.8.8.1 проходит, остальная РФ -- нет.
+rules:
+  - set: ru-ext
+    action: deny
+    response: blocked
+
+default: allow

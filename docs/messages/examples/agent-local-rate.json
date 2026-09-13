@@ -1,0 +1,41 @@
+{
+  "ray": "c4e91a07-2b6d-4f11-9a33-0e5c8d7b2a14",
+  "node": "nginx-1",
+  "phase": "request",
+  "ts": "2026-08-15T21:40:02.907Z",
+  "client_ip": "203.0.113.77",
+  "client_port": 54233,
+  "server_ip": "10.0.0.8",
+  "server_port": 443,
+  "tls": {
+    "version": "TLSv1.3",
+    "sni": "shop.example.com"
+  },
+  "http": {
+    "method": "GET",
+    "scheme": "https",
+    "host": "shop.example.com",
+    "uri": "/api/orders",
+    "version": "HTTP/1.1",
+    "args_size": 12,
+    "headers_size": 288,
+    "headers_count": 9,
+    "body_size": 0,
+    "status": 429
+  },
+  "route": {
+    "server_name": "shop.example.com",
+    "location": "/api/"
+  },
+  "verdict": "deny",
+  "code": "local_rate",
+  "by": "module",
+  "inspectors": {
+    "module": { "verdict": "deny" }
+  },
+  "vars": {
+    "ua": "curl/8.5.0",
+    "country": "NL"
+  },
+  "waf_latency_us": 350
+}

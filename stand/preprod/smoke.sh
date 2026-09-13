@@ -98,8 +98,26 @@ print("снято: объявление ip")
 EOF
     fi
 
-    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/config/send" || true)
-    echo "поколение без дыма разослано: $code"
+    # Уборка кончается, когда узел применил поколение без дыма: следующий шаг
+    # (./stand.sh check) иначе застал бы канал nginx посреди применения.
+    out=$(curl -s -X POST "$api/config/send" || true)
+    hash=$(printf '%s' "$out" | "$PY" -c 'import json, sys; print(json.load(sys.stdin).get("config_hash", ""))' 2>/dev/null || true)
+
+    if [ -z "$hash" ]; then
+        echo "поколение без дыма не разослано: $out"
+        return 0
+    fi
+
+    i=0
+    while [ "$(applied "$hash")" != ok ]; do
+        i=$((i + 1))
+        if [ $i -ge 30 ]; then
+            echo "узел не отчитался поколением без дыма за минуту"
+            return 0
+        fi
+        sleep 2
+    done
+    echo "узел применил поколение без дыма"
 }
 
 trap cleanup EXIT

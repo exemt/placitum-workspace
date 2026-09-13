@@ -77,12 +77,17 @@ if (servers.length > 0) {
   );
 }
 
-const { channels = [] } = await get(`${base}/convergence`);
-check(
-  "каналы сошлись",
-  channels.length > 0 && channels.every((c) => c.state === "ok" || c.state === "nobody"),
-  channels.map((c) => `${c.id}=${c.state}`).join(" "),
-);
+// Сразу после рассылки канал бывает посреди применения (converging): это не
+// расхождение, а минута ожидания. Расхождение -- то, что не сошлось за неё.
+const settled = (list) => list.length > 0 && list.every((c) => c.state === "ok" || c.state === "nobody");
+let { channels = [] } = await get(`${base}/convergence`);
+
+for (let waited = 0; !settled(channels) && waited < 60; waited += 3) {
+  await new Promise((resolve) => setTimeout(resolve, 3000));
+  ({ channels = [] } = await get(`${base}/convergence`));
+}
+
+check("каналы сошлись", settled(channels), channels.map((c) => `${c.id}=${c.state}`).join(" "));
 
 const fleet = await get("/api/fleet");
 const members = ["agents", "inspectors", "stores", "services"].flatMap((key) =>

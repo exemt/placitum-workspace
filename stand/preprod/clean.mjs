@@ -68,13 +68,25 @@ check(
 const datasets = rows(await get(`${base}/datasets`), "datasets");
 check("нет схемы-примера", !datasets.some((d) => d.name === "example-openapi.json"), `${datasets.length} наборов`);
 
+// Пути панели: форма и статика мимо калитки, сокет, выгрузка гео, заведение
+// пользователя и корень -- за ней.
+const PANEL_PATHS = [
+  "/",
+  "/assets/",
+  "/waf/panel-login",
+  "= /agent_health_socket",
+  "= /favicon.ico",
+  "= /favicon.svg",
+  "~ ^/api/[^/]+/auth/user-line$",
+  "~ ^/api/[^/]+/geo/import/",
+];
+
 if (servers.length > 0) {
   const locations = rows(await get(`${base}/servers/${servers[0].uuid}/locations`), "locations");
-  check(
-    "пути панели",
-    locations.length === 5,
-    locations.map((l) => `${l.match === "exact" ? "= " : l.match === "regex" ? "~ " : ""}${l.path}`).join("; "),
-  );
+  const paths = locations
+    .map((l) => `${l.match === "exact" ? "= " : l.match === "regex" ? "~ " : ""}${l.path}`)
+    .sort();
+  check("пути панели", paths.join("\n") === [...PANEL_PATHS].sort().join("\n"), paths.join("; "));
 }
 
 // Сразу после рассылки канал бывает посреди применения (converging): это не

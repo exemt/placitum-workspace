@@ -20,7 +20,9 @@ project=placitum
 store=$here/.baseline
 
 envval() { sed -n "s/^$1=//p" "$core/.env" 2>/dev/null; }
-panel_port=$(envval PLC_PANEL_PORT)
+# API контроллера мимо калитки: loopback-порт установки. Панель для людей -- за
+# узлом (PLC_PANEL_PORT), наборам туда не нужно.
+panel_port=$(envval PLC_CONTROLLER_PORT)
 node_port=$(envval PLC_HTTP_PORT)
 panel=http://127.0.0.1:${panel_port:-8080}
 

@@ -122,12 +122,13 @@ fresh() {
     smoke
 }
 
-# Дым смотрит с самой машины, как оператор после установки: адреса панели и
-# узла -- из ответов стенда.
+# Дым смотрит с самой машины, как оператор после установки: адреса API
+# контроллера и узла -- из ответов стенда. API -- мимо калитки, на loopback:
+# дым проверяет контур, а не вход в панель.
 smoke() {
     [ -f "$root/smoke.sh" ] || die "нет smoke.sh рядом со stand.sh"
     . "$answers"
-    sh "$root/smoke.sh" "http://127.0.0.1:${PLC_PANEL_PORT:-8080}" "http://127.0.0.1:${PLC_HTTP_PORT:-80}"
+    sh "$root/smoke.sh" "http://127.0.0.1:${PLC_CONTROLLER_PORT:-8080}" "http://127.0.0.1:${PLC_HTTP_PORT:-80}"
 }
 
 status() {
@@ -148,7 +149,7 @@ status() {
 doctor() {
     say "порты хоста"
     . "$answers"
-    for p in "${PLC_HTTP_PORT:-80}" "${PLC_HTTPS_PORT:-443}" "${PLC_PANEL_PORT:-8080}"; do
+    for p in "${PLC_HTTP_PORT:-80}" "${PLC_HTTPS_PORT:-443}" "${PLC_PANEL_PORT:-8081}" "${PLC_CONTROLLER_PORT:-8080}"; do
         if ss -ltn "sport = :$p" 2>/dev/null | grep -q LISTEN; then
             warn "порт $p занят"
         else

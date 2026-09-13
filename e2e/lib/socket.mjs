@@ -15,7 +15,7 @@
 
 import { connect } from "node:net";
 
-import { OP, clientKey, decodeFrames, encodeFrame } from "../../nginx/tests/ws/ws.mjs";
+import { OP, clientKey, decodeFrames, encodeFrame } from "../../node/tests/ws/ws.mjs";
 import { SETTLE_MS } from "./check.mjs";
 import { EDGE } from "./stand.mjs";
 

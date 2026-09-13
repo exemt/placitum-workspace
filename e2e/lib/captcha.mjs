@@ -25,7 +25,8 @@ import { promisify } from "node:util";
 import { EDGE } from "./stand.mjs";
 
 const run = promisify(execFile);
-const DEPLOY = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "deploy");
+/* Контур — проект compose стенда: exec по имени проекта, файл compose не нужен. */
+const PROJECT = process.env.WAF_E2E_PROJECT ?? "placitum";
 
 /* Форма нонса на странице виджета: скрытое поле формы, шестнадцатеричное. */
 const CSRF_RE = /name="csrf"\s+value="([a-f0-9]+)"/;
@@ -133,8 +134,8 @@ async function answerOf(nonce) {
   try {
     const { stdout } = await run(
       "docker",
-      ["compose", "exec", "-T", "redis-internal", "redis-cli", "--raw", "get", key],
-      { cwd: DEPLOY, windowsHide: true },
+      ["compose", "-p", PROJECT, "exec", "-T", "redis-internal", "redis-cli", "--raw", "get", key],
+      { windowsHide: true },
     );
     const answer = stdout.trim();
 

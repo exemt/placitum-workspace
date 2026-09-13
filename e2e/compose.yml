@@ -1,0 +1,28 @@
+# Надстройка e2e над core/compose/waf.yml. Подключает e2e/e2e.sh вторым -f.
+#
+# Пути считаются от core/compose — каталога первого файла, так compose читает
+# несколько -f.
+
+services:
+
+  # Витрина: защищаемое приложение кейсов. Апстрим в кейсах — app:8080, поэтому имя
+  # сервиса именно app. Про контур не знает, вердиктов не выносит. Порт наружу —
+  # только на loopback: сравнить ответ напрямую и через край.
+  app:
+    build:
+      context: ../../e2e/testapp
+    image: placitum/testapp
+    cpus: "1.0"
+    mem_limit: 512m
+    restart: unless-stopped
+    environment:
+      APP_NAME: shop
+      APP_LOG: info
+    ports:
+      - "127.0.0.1:8083:8080"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 3s

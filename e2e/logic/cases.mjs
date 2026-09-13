@@ -685,7 +685,7 @@ export const cases = [
       authProfiles: [JWT_GATE],
       upstreams: [APP],
       declarations: {
-        "e2e-gate": { process: "auth2", profileFrom: "e2e-cnt-gate" },
+        "e2e-gate": { process: "auth", profileFrom: "e2e-cnt-gate" },
         "e2e-cnt": { process: "counter", profileFrom: "e2e-cnt-user" },
       },
       servers: [SERVER_SPEC],
@@ -807,7 +807,7 @@ export const cases = [
       authProfiles: [JWT_GATE],
       upstreams: [APP],
       declarations: {
-        "e2e-gate": { process: "auth2", profileFrom: "e2e-cnt-gate" },
+        "e2e-gate": { process: "auth", profileFrom: "e2e-cnt-gate" },
         "e2e-cnt": { process: "counter", profileFrom: "e2e-cnt-mask" },
         "e2e-rw": { process: "rewrite", profileFrom: "e2e-cnt-rewrite" },
       },
@@ -934,8 +934,8 @@ export const cases = [
       ],
       upstreams: [APP],
       declarations: {
-        "e2e-gate": { process: "auth2", profileFrom: "e2e-cnt-gate" },
-        "e2e-gate-none": { process: "auth2", profileFrom: "e2e-cnt-gate-none" },
+        "e2e-gate": { process: "auth", profileFrom: "e2e-cnt-gate" },
+        "e2e-gate-none": { process: "auth", profileFrom: "e2e-cnt-gate-none" },
         "e2e-cnt": { process: "counter", profileFrom: "e2e-cnt-user" },
       },
       servers: [SERVER_SPEC],
@@ -1174,7 +1174,7 @@ export const cases = [
       authProfiles: [JWT_GATE],
       upstreams: [APP],
       declarations: {
-        "e2e-gate": { process: "auth2", profileFrom: "e2e-cnt-gate" },
+        "e2e-gate": { process: "auth", profileFrom: "e2e-cnt-gate" },
         "e2e-cnt": { process: "counter", profileFrom: "e2e-cnt-frames" },
         "e2e-rw": { process: "rewrite", profileFrom: "e2e-cnt-rewrite" },
       },
@@ -2293,10 +2293,15 @@ export const cases = [
          * Оба набора живые и объявлены краю (`in_nginx`): по первому узел
          * зовёт капчу условием вызова, по второму режет локальной проверкой.
          * Вечных записей у живого набора нет: срок у набора и у каждой записи.
+         *
+         * Лимит записей явный: край держит набор в общей зоне waf по 128 байт на
+         * запись, и умолчательный миллион на набор в поставочную зону (8 МБ) не
+         * влезает -- nginx -t на крае отвергает поколение целиком.
          */
         {
           name: "e2e-sft-suspects",
           description: "Подозреваемые: ловушка, выкачка, касса в обход витрины",
+          limit: 10000,
           type: "ip",
           active: true,
           in_nginx: true,
@@ -2305,6 +2310,7 @@ export const cases = [
         {
           name: "e2e-sft-banned",
           description: "Бан подсети за перебор заказов",
+          limit: 10000,
           type: "ip",
           active: true,
           in_nginx: true,

@@ -590,7 +590,7 @@ export const cases = [
       authProfiles: [{ name: "e2e-load-gate", sourceFrom: "e2e-load-jwt" }],
       upstreams: [APP],
       declarations: {
-        "e2e-gate": { process: "auth2", profileFrom: "e2e-load-gate" },
+        "e2e-gate": { process: "auth", profileFrom: "e2e-load-gate" },
         "e2e-cnt": { process: "counter", profileFrom: "e2e-load-counter" },
       },
       servers: [

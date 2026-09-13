@@ -154,8 +154,11 @@ baseline() {
         return 0
     fi
 
+    # Стенд приводится к текущей надстройке: сменилась она — контейнеры пересоздаются до
+    # снимка, иначе эталон сняли бы с того, что поднято по старому compose.
     say "стенд до снимка"
-    wait_healthy 120
+    compose up -d
+    wait_healthy 300
     fixtures
     publish_all
     gen=$(generation)
@@ -256,13 +259,26 @@ run() {
 
     reset
     say "набор $suite $*"
-    local rc=0
+    local rc=0 started report svc
+    started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     (
         cd "$here"
         WAF_CONTROLLER=$panel WAF_E2E_EDGE=${WAF_E2E_EDGE:-http://127.0.0.1:${node_port:-80}} \
             node "$suite/run.mjs" --no-bootstrap "$@"
     ) || rc=$?
     say "набор $suite: код $rc"
+
+    # Упавший набор: журналы контейнеров за время набора — до сброса. Сброс пересоздаёт
+    # контейнеры, и причина (отказ nginx -t на крае, ошибка инспектора) уходит вместе с ними.
+    if [ "$rc" -ne 0 ]; then
+        report=$here/reports/$(date +%Y%m%d-%H%M%S)-$suite
+        mkdir -p "$report"
+        for svc in $(compose ps --services); do
+            compose logs --no-color --since "$started" "$svc" > "$report/$svc.log" 2>&1 || true
+        done
+        printf 'журналы контейнеров за набор: %s\n' "$report"
+    fi
+
     reset
     return "$rc"
 }

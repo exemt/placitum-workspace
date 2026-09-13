@@ -1,13 +1,14 @@
 #!/bin/sh
 # Пре-прод: стенд раскатки и установки.
 #
-#     ./stand.sh fresh     полный сброс, установка с нуля и дым -- главный прогон
+#     ./stand.sh fresh     полный сброс, установка с нуля, проверка, дым и снова проверка -- главный прогон
 #     ./stand.sh reset     снести установку: контейнеры, тома, образы, ответы
 #     ./stand.sh update    подтянуть core из публичного репозитория
 #     ./stand.sh install   установка поверх текущего состояния
+#     ./stand.sh check     чистая установка: один сервер -- панель, каналы сошлись, всё здорово
 #     ./stand.sh status    что стоит
 #     ./stand.sh doctor    что мешает установке прямо сейчас
-#     ./stand.sh smoke     дым на поставленном контуре: маршрут через API и узел
+#     ./stand.sh smoke     дым на поставленном контуре: маршрут через API и узел, с уборкой
 #
 # Стенд ставит ровно то, что ставит клиент: выкачивает публичный placitum-core
 # и запускает его install.sh. Приватного монорепозитория на машине нет и быть
@@ -83,10 +84,17 @@ reset() {
     say "сношу установку"
     compose_down
 
-    # Образы компонентов: их собирает установка, и следующий прогон обязан
-    # собрать их заново. Базовые образы (postgres, nats, ...) остаются -- они
-    # приезжают из реестра, пересборки не требуют и качаются по десять минут.
-    imgs=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep '^placitum/' || true)
+    # Образы компонентов -- те, что называет compose установки: их собирает
+    # установка, и следующий прогон обязан собрать их заново. Имена у них двух
+    # видов (placitum/<имя> и placitum-<имя>), поэтому список берётся из compose,
+    # а не по приставке. Базовые образы (postgres, nats, ...) остаются -- они
+    # приезжают из реестра, пересборки не требуют и качаются по десять минут;
+    # образов e2e и профиля vlai compose установки не называет.
+    sources=
+    [ -f "$core/sources.env" ] && sources="--env-file $core/sources.env"
+    # shellcheck disable=SC2086
+    imgs=$(docker compose -p "$project" --env-file "$answers" $sources \
+        -f "$core/compose/waf.yml" config --images 2>/dev/null | grep -E '^placitum[-/]' || true)
     [ -n "$imgs" ] && printf '%s\n' "$imgs" | xargs -r docker rmi -f >/dev/null 2>&1 || true
 
     # Ответы и секреты: установка обязана завести их сама, иначе прогон
@@ -119,7 +127,11 @@ fresh() {
     update
     reset
     install
+    say "чистая установка"
+    check
     smoke
+    say "после дыма: установка та же"
+    check
 }
 
 # Дым смотрит с самой машины, как оператор после установки: адреса API
@@ -129,6 +141,15 @@ smoke() {
     [ -f "$root/smoke.sh" ] || die "нет smoke.sh рядом со stand.sh"
     . "$answers"
     sh "$root/smoke.sh" "http://127.0.0.1:${PLC_CONTROLLER_PORT:-8080}" "http://127.0.0.1:${PLC_HTTP_PORT:-80}"
+}
+
+# Чистая установка глазами пользователя: один сервер -- сама панель, каналы
+# сошлись, флот и контейнеры здоровы. После дыма то же самое: он убирает за собой.
+check() {
+    [ -f "$root/clean.mjs" ] || die "нет clean.mjs рядом со stand.sh"
+    command -v node >/dev/null 2>&1 || die "нужен node: им проверяется установка"
+    . "$answers"
+    node "$root/clean.mjs" "http://127.0.0.1:${PLC_CONTROLLER_PORT:-8080}" "$project-edge-1"
 }
 
 status() {
@@ -192,6 +213,7 @@ case "${1:-help}" in
     reset)   reset ;;
     update)  update ;;
     install) install ;;
+    check)   check ;;
     status)  status ;;
     doctor)  clone; doctor ;;
     smoke)   smoke ;;

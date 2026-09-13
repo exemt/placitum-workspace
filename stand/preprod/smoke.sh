@@ -21,8 +21,12 @@
 # поколением: применяет он его асинхронно, и до reload запросы обслуживают
 # старые воркеры по старому поколению -- мимо инспектора, если там waf off.
 #
-# Повторный запуск ничего не плодит: объекты ищутся по имени, путь /smoke
-# пересоздаётся. JSON разбирает python3 -- jq на машине установки не обещан.
+# Дым убирает за собой, в том числе после сбоя: путь /smoke и всё, что он завёл
+# сам -- апстрим, сервер, порт, объявление ip, -- снимается, и узлу уходит
+# поколение без них. Установка после дыма остаётся той, что поставил
+# установщик: в панели пользователя тестовым объектам не место. Оставить --
+# SMOKE_KEEP=1. Объекты ищутся по имени, так что повторный запуск ничего не
+# плодит. JSON разбирает python3 -- jq на машине установки не обещан.
 set -eu
 
 CTRL=${1:-http://127.0.0.1:8080}
@@ -30,10 +34,75 @@ NODE=${2:-http://127.0.0.1}
 BURST=50
 PY=$(command -v python3 || command -v python || true)
 tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
+
+# Что завёл этот прогон: снимается только оно.
+api=""
+created_loc=""
+created_srv=""
+created_port=""
+created_ups=""
+declared_ip=""
 
 say() { printf '\n== %s\n' "$*"; }
 die() { printf '!! %s\n' "$*" >&2; exit 1; }
+
+# drop <путь> <что> -- DELETE без отказа: уборка не должна прятать причину сбоя.
+drop() {
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$api$1" || true)
+
+    case "$code" in
+        2??) echo "снято: $2" ;;
+        *) echo "не снято: $2 ($code)" ;;
+    esac
+}
+
+cleanup() {
+    rm -f "$tmp"
+
+    [ "${SMOKE_KEEP:-}" != 1 ] || return 0
+    [ -n "$api" ] || return 0
+    [ -n "$created_loc$created_srv$created_port$created_ups$declared_ip" ] || return 0
+
+    say "уборка: снимаю то, что завёл дым"
+
+    [ -z "$created_loc" ] || drop "/locations/$created_loc" "путь /smoke"
+    [ -z "$created_srv" ] || drop "/servers/$created_srv" "сервер smoke.local"
+    [ -z "$created_port" ] || drop "/ports/$created_port" "порт 8080"
+    [ -z "$created_ups" ] || drop "/upstreams/$created_ups" "апстрим smoke-controller"
+
+    if [ -n "$declared_ip" ]; then
+        "$PY" - "$api" <<'EOF' || echo "не снято: объявление ip"
+import json
+import sys
+import urllib.request
+
+api = sys.argv[1]
+
+
+def call(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(api + path, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as res:
+        return json.loads(res.read() or b"null")
+
+
+doc = call("GET", "/http")
+waf = dict(doc.get("waf") or {})
+declared = dict(waf.get("inspectors") or {})
+declared.pop("ip", None)
+body = {k: doc.get(k) for k in ("nginx_main", "nginx", "waf_http", "raw", "raw_nginx")}
+body["waf"] = {**waf, "inspectors": declared}
+call("PUT", "/http", body)
+print("снято: объявление ip")
+EOF
+    fi
+
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/config/send" || true)
+    echo "поколение без дыма разослано: $code"
+}
+
+trap cleanup EXIT
 
 [ -n "$PY" ] || die "нужен python3: им разбирается JSON ответов"
 
@@ -95,7 +164,7 @@ api=$CTRL/api/$scope
 echo "$scope"
 
 say "инспектор ip объявлен на пространстве"
-"$PY" - "$api" <<'EOF'
+declared=$("$PY" - "$api" <<'EOF'
 import json
 import sys
 import urllib.request
@@ -124,6 +193,9 @@ else:
     saved = call("PUT", "/http", body)
     print("объявлены:", ", ".join(sorted(saved["waf"]["inspectors"])))
 EOF
+)
+echo "$declared"
+case "$declared" in объявлены*) declared_ip=1 ;; esac
 
 say "апстрим smoke-controller: controller:8080"
 out=$(send GET /upstreams)
@@ -133,6 +205,7 @@ if [ -z "$ups" ]; then
     out=$(send POST /upstreams \
         '{"name":"smoke-controller","method":"round_robin","peers":[{"host":"controller","port":8080,"weight":1}]}')
     ups=$(printf '%s' "$out" | json 'd["uuid"]')
+    created_ups=$ups
 fi
 echo "$ups"
 
@@ -142,6 +215,7 @@ srv=$(printf '%s' "$out" | json 'next((s["uuid"] for s in d.get("servers", []) i
 if [ -z "$srv" ]; then
     out=$(send POST /servers '{"name":"smoke.local","server_names":["smoke.local"],"enabled":true}')
     srv=$(printf '%s' "$out" | json 'd["uuid"]')
+    created_srv=$srv
 fi
 
 out=$(send GET /ports)
@@ -150,6 +224,7 @@ if [ -z "$port" ]; then
     out=$(send POST /ports \
         '{"name":"http-8080","address":"0.0.0.0","port":8080,"ssl":false,"http2":false,"proxy_protocol":false}')
     port=$(printf '%s' "$out" | json 'd["uuid"]')
+    created_port=$port
 fi
 
 out=$(send GET "/servers/$srv/ports")
@@ -174,7 +249,8 @@ out=$(send POST "/servers/$srv/locations" "{
           \"responseInspectors\": \"none\", \"scoreDeny\": {\"threshold\": 50, \"response\": \"suspicious\"},
           \"preview\": [\"request headers=2k/256 args=512\"]}
 }")
-echo "location=$(printf '%s' "$out" | json 'd["uuid"]')"
+created_loc=$(printf '%s' "$out" | json 'd["uuid"]')
+echo "location=$created_loc"
 
 say "«Разослать» и узел применил поколение"
 out=$(send POST /config/send)

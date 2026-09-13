@@ -104,7 +104,8 @@ reset() {
     # калитки, капчи и cookie), и перечисление отставало бы от неё молча.
     find "$core/secrets" -type f ! -name .gitignore -delete 2>/dev/null || true
 
-    printf 'снесено: контейнеры, тома, образы placitum/*, ответы и секреты\n'
+    printf 'снесено: контейнеры, тома, образы установки (%s), ответы и секреты\n' \
+        "$(printf '%s' "$imgs" | grep -c . || true)"
 }
 
 answer() {
